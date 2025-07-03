@@ -3,8 +3,6 @@
 const crypto = require('crypto');
 const gql = require('graphql-tag');
 
-const SHOPIFY_API_VERSION = '2024-10';
-
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // This should be a shared secret between your app and the proxy
 /*
   Encrypt the token with a aes-256-cbc cipher, for example:
@@ -80,6 +78,7 @@ const getShopAccessToken = async (encryptedAccessToken) => {
 module.exports.main = async (event) => {
   const proxyToken = event.headers['x-shopify-access-token'] || event.headers['X-Shopify-Access-Token'];
   const shopifyDomain = event.headers['x-shopify-shop-domain'] || event.headers['X-Shopify-Shop-Domain'];
+  const shopifyApiVersion = event.headers['x-shopify-api-version'] || event.headers['X-Shopify-Api-Version'];
 
   if (!proxyToken) {
     console.error('Missing X-Shopify-Access-Token header');
@@ -89,6 +88,10 @@ module.exports.main = async (event) => {
     console.error('Missing X-Shopify-Shop-Domain header');
     return buildResponse(400, { error: 'Missing X-Shopify-Shop-Domain header' });
   }
+  if (!shopifyApiVersion) {
+    console.error('Missing X-Shopify-Api-Version header');
+    return buildResponse(400, { error: 'Missing X-Shopify-Api-Version header' });
+  }
 
   try {
     const shopify_access_token = await getShopAccessToken(proxyToken);
@@ -97,7 +100,7 @@ module.exports.main = async (event) => {
       return buildResponse(403, { error: 'Operation not allowed' });
     }
 
-    const url = `https://${shopifyDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+    const url = `https://${shopifyDomain}/admin/api/${shopifyApiVersion}/graphql.json`;
     const shopifyResponse = await fetch(url,
       {
         method: 'POST',

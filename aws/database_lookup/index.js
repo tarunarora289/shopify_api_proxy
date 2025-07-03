@@ -3,8 +3,6 @@
 const mysql = require('mysql2/promise');
 const gql = require('graphql-tag');
 
-const SHOPIFY_API_VERSION = '2024-10';
-
 const ALLOWED_QUERIES = [
   'shop',
   'app',
@@ -72,9 +70,13 @@ const getShopAccessToken = async (shopToken) => {
 
 module.exports.main = async (event) => {
   const proxyToken = event.headers['X-Shopify-Access-Token'];
+  const shopifyApiVersion = event.headers['x-shopify-api-version'] || event.headers['X-Shopify-Api-Version'];
 
   if (!proxyToken) {
     return buildResponse(400, { error: 'Missing X-Shopify-Access-Token header' });
+  }
+  if (!shopifyApiVersion) {
+    return buildResponse(400, { error: 'Missing X-Shopify-Api-Version header' });
   }
 
   try {
@@ -84,7 +86,7 @@ module.exports.main = async (event) => {
       return buildResponse(403, { error: 'Operation not allowed' });
     }
 
-    const url = `https://${shopify_domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+    const url = `https://${shopify_domain}/admin/api/${shopifyApiVersion}/graphql.json`;
     const shopifyResponse = await fetch(url,
       {
         method: 'POST',
