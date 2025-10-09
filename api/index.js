@@ -7,7 +7,7 @@ module.exports = async (req, res) => {
   }
   const token = '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'; // Replace with your new regenerated token
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
-  const encodedQuery = encodeURIComponent(`name:#${query}`);
+  const encodedQuery = encodeURIComponent(`order_number:${query}`); // Changed from name to order_number
   const encodedContact = encodeURIComponent(contact);
   const contactField = contact.includes('@') ? 'customer_email' : 'customer_phone';
   const apiUrl = `https://${storeDomain}/admin/api/2025-10/orders/search.json?query=${encodedQuery}+${contactField}:${encodedContact}`;
