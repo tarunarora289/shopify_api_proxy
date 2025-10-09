@@ -23,21 +23,8 @@ module.exports = async (req, res) => {
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'No error details');
       console.log('API Response Error:', errorText);
-      if (response.status === 404) {
-        const idUrl = `https://${storeDomain}/admin/api/2025-10/orders/${encodeURIComponent(query)}.json`;
-        console.log('Fallback URL:', idUrl);
-        const fallbackResponse = await fetch(idUrl, {
-          headers: {
-            'X-Shopify-Access-Token': token,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-          }
-        });
-        if (!fallbackResponse.ok) {
-          throw new Error(`Fallback HTTP error! status: ${fallbackResponse.status} - ${await fallbackResponse.text().catch(() => 'No error details')}`);
-        }
-        const data = await fallbackResponse.json();
-        return res.json(data);
+      if (response.status === 404 || errorText.includes('Not Found')) {
+        return res.status(404).json({ error: 'Order not found with provided query and contact' });
       }
       throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
     }
