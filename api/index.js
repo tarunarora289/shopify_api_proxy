@@ -5,7 +5,7 @@ module.exports = async (req, res) => {
   if (!query || !contact) {
     return res.status(400).json({ error: 'Missing query or contact parameter' });
   }
-  const token = 'shpat_NEW_TOKEN_HERE'; // Replace with your new regenerated token
+  const token = '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'; // Replace with your new regenerated token
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
   const encodedQuery = encodeURIComponent(`name:#${query}`);
   const encodedContact = encodeURIComponent(contact);
