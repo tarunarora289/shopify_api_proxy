@@ -4,8 +4,10 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: 'Missing query or contact parameter' });
   }
   const token = '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'; // Your token
-  const storeDomain = 'trueweststore.myshopify.com'; // Replace with your actual store domain
-  const apiUrl = `https://${storeDomain}/admin/api/2025-10/orders/search.json?query=name:${encodeURIComponent(query)} ${contact.includes('@') ? 'customer_email' : 'customer_phone'}:${encodeURIComponent(contact)}`;
+  const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
+  const fullQuery = `name:%23${encodeURIComponent(query)} ${contact.includes('@') ? 'customer_email' : 'customer_phone'}:${encodeURIComponent(contact)}`;
+  const apiUrl = `https://${storeDomain}/admin/api/2025-10/orders/search.json?query=${encodeURIComponent(fullQuery)}`;
+  console.log('Fetching URL:', apiUrl); // Debug log
   try {
     const response = await fetch(apiUrl, {
       headers: {
@@ -14,7 +16,8 @@ module.exports = async (req, res) => {
       }
     });
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+      const errorText = await response.text(); // Capture full response
+      throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
     }
     const data = await response.json();
     res.json(data);
