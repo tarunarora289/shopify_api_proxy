@@ -1,58 +1,47 @@
-const fetch = require('node-fetch');
+// api/index.js
+import fetch from 'node-fetch';
 
-module.exports = async (req, res) => {
-  const { query, contact } = req.query;
-
+export default async (req, res) => {
+  const { query, contact } = req.query || {};
   if (!query || !contact) {
     return res.status(400).json({ error: 'Missing query or contact parameter' });
   }
-
-  const token = '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'; // Your token
+  const token = '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'; // Replace with your new regenerated token
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
-
-  // Remove leading '#' if any from order number
-  const sanitizedQuery = query.toString().replace(/^#/, '').trim();
-  const contactField = contact.includes('@') ? 'customer_email' : 'customer_phone';
+  const encodedQuery = encodeURIComponent(`name:#${query}`);
   const encodedContact = encodeURIComponent(contact);
-
-  // Use stable API version 2024-10 (recommended)
-  const apiUrl = `https://${storeDomain}/admin/api/2024-10/orders/search.json?query=name:${sanitizedQuery}+${contactField}:${encodedContact}`;
-
+  const contactField = contact.includes('@') ? 'customer_email' : 'customer_phone';
+  const apiUrl = `https://${storeDomain}/admin/api/2025-10/orders/search.json?query=${encodedQuery}+${contactField}:${encodedContact}`;
   console.log('Fetching URL:', apiUrl); // Debug log
-
   try {
     const response = await fetch(apiUrl, {
       headers: {
         'X-Shopify-Access-Token': token,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
       }
     });
-
     if (!response.ok) {
-      const errorText = await response.text();
-
+      const errorText = await response.text().catch(() => 'No error details');
+      console.log('API Response Error:', errorText);
       if (response.status === 404) {
-        // Fallback: fetch order by ID
-        const idUrl = `https://${storeDomain}/admin/api/2024-10/orders/${encodeURIComponent(sanitizedQuery)}.json`;
+        const idUrl = `https://${storeDomain}/admin/api/2025-10/orders/${encodeURIComponent(query)}.json`;
         console.log('Fallback URL:', idUrl);
-
         const fallbackResponse = await fetch(idUrl, {
           headers: {
             'X-Shopify-Access-Token': token,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
           }
         });
-
         if (!fallbackResponse.ok) {
-          throw new Error(`Fallback HTTP error! status: ${fallbackResponse.status} - ${await fallbackResponse.text()}`);
+          throw new Error(`Fallback HTTP error! status: ${fallbackResponse.status} - ${await fallbackResponse.text().catch(() => 'No error details')}`);
         }
-        const fallbackData = await fallbackResponse.json();
-        return res.json(fallbackData);
+        const data = await fallbackResponse.json();
+        return res.json(data);
       }
-
       throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
     }
-
     const data = await response.json();
     res.json(data);
   } catch (err) {
