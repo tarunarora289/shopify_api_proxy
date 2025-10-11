@@ -14,31 +14,28 @@ module.exports = async (req, res) => {
   if (!query || !contact) {
     return res.status(400).json({ error: 'Missing query or contact parameter' });
   }
-
-  const token = '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'; // Verify this token
-  const storeDomain = 'trueweststore.myshopify.com';
+  const token = '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'; // Your token
+  const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
   const encodedQuery = encodeURIComponent(`name:#${query}`);
   const encodedContact = encodeURIComponent(contact);
   const contactField = contact.includes('@') ? 'customer_email' : 'customer_phone';
-  const apiUrl = `https://${storeDomain}/admin/api/2024-10/orders/search.json?query=${encodedQuery}+${contactField}:${encodedContact}`;
+  const apiUrl = `https://${storeDomain}/admin/api/2025-10/orders/search.json?query=${encodedQuery}+${contactField}:${encodedContact}`;
   console.log('Fetching URL:', apiUrl); // Debug log
-
   try {
     const response = await fetch(apiUrl, {
       headers: {
         'X-Shopify-Access-Token': token,
-        'Content-Type': 'application/json',
-        'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+        'Content-Type': 'application/json'
       }
     });
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Shopify API error! status: ${response.status} - ${errorText}`);
+      throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
     }
     const data = await response.json();
     res.json(data);
   } catch (err) {
-    console.error('Proxy error details:', err.message); // Log full error
-    res.status(500).json({ error: 'Proxy failed: ' + err.message });
+    console.error('Proxy error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch from Shopify API: ' + err.message });
   }
 };
