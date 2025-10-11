@@ -1,11 +1,12 @@
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  // CORS headers
+  // Add CORS headers to allow Shopify page access
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
+  // Handle OPTIONS request for CORS preflight
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
@@ -13,11 +14,12 @@ module.exports = async (req, res) => {
 
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
-  const token = 'shpat_NEW_TOKEN_HERE'; // Paste your new regenerated token here
-  const storeDomain = 'trueweststore.myshopify.com';
+  const token = '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'; // Your working token
+  const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
 
-  // Handle POST for exchange submission
+  // Handle POST request for exchange submission
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
+    console.log('Processing exchange submission for customer_id:', customer_id); // Debug log
     try {
       const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
         method: 'POST',
@@ -32,12 +34,13 @@ module.exports = async (req, res) => {
       const data = await response.json();
       res.json(data);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      console.error('Proxy error (POST):', err.message); // Log full error
+      res.status(500).json({ error: 'Proxy failed (POST): ' + err.message });
     }
     return;
   }
 
-  // Handle GET for order lookup
+  // Handle GET request for order lookup
   if (req.method === 'GET') {
     if (!query) {
       return res.status(400).json({ error: 'Missing query parameter (order number)' });
@@ -89,7 +92,7 @@ module.exports = async (req, res) => {
       }
       res.json(data);
     } catch (err) {
-      console.error('Proxy error:', err.message);
+      console.error('Proxy error (GET):', err.message); // Log full error
       res.status(500).json({ error: 'Failed to fetch from Shopify API: ' + err.message });
     }
     return;
