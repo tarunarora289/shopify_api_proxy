@@ -66,7 +66,7 @@ module.exports = async (req, res) => {
         const customerId = customerData.customers[0].id;
         console.log('Found customer ID:', customerId);
         const ordersQuery = `customer_id:${customerId} name:#${encodeURIComponent(query)}`;
-        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&limit=10`;
+        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&fields=line_items{product_id,variant_id,title,variant_title,image_url}&limit=10`;
         console.log('Fetching orders URL:', ordersUrl);
         const ordersResponse = await fetch(ordersUrl, {
           headers: {
@@ -78,7 +78,7 @@ module.exports = async (req, res) => {
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
         data = await ordersResponse.json();
       } else {
-        const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
+        const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&fields=line_items{product_id,variant_id,title,variant_title,image_url}&limit=10`;
         console.log('Fetching URL:', apiUrl);
         const response = await fetch(apiUrl, {
           headers: {
