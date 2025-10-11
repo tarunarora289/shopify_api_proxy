@@ -5,12 +5,12 @@ module.exports = async (req, res) => {
   if (!query || !contact) {
     return res.status(400).json({ error: 'Missing query or contact parameter' });
   }
-  const token = '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'; // Replace with your new regenerated token
+  const token = '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'; // Replace with your new token if needed
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
-  const encodedQuery = encodeURIComponent(`order_number:${query}`); // Changed from name to order_number
+  const encodedQuery = encodeURIComponent(`${query}`); // Raw query, Shopify handles name format
   const encodedContact = encodeURIComponent(contact);
   const contactField = contact.includes('@') ? 'customer_email' : 'customer_phone';
-  const apiUrl = `https://${storeDomain}/admin/api/2025-10/orders/search.json?query=${encodedQuery}+${contactField}:${encodedContact}`;
+  const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders/search.json?query=name:${encodedQuery}+${contactField}:${encodedContact}&limit=10`;
   console.log('Fetching URL:', apiUrl); // Debug log
   try {
     const response = await fetch(apiUrl, {
