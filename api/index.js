@@ -12,13 +12,13 @@ module.exports = async (req, res) => {
     return;
   }
 
-  const { query, contact, action, order_number, item_id } = req.query || {};
-  const { action: bodyAction, order, customer_id } = req.body || {};
+  const { query, contact } = req.query || {};
+  const { action, order, customer_id } = req.body || {};
   const token = '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'; // Replace with new token if 401 persists
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
 
   // Handle POST request for exchange submission
-  if (req.method === 'POST' && bodyAction === 'submit_exchange' && order && customer_id) {
+  if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     console.log('Processing exchange submission for customer_id:', customer_id); // Debug log
     try {
       const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
@@ -140,96 +140,6 @@ module.exports = async (req, res) => {
     } catch (err) {
       console.error('Proxy error (GET):', err.message); // Log full error
       res.status(500).json({ error: 'Failed to fetch from Shopify API: ' + err.message });
-    }
-    return;
-  }
-
-  // New GET endpoint for fetching available sizes using existing variants
-  if (req.method === 'GET' && action === 'get_available_sizes' && order_number && contact && item_id) {
-    try {
-      // Find the customer by contact
-      const contactField = contact.includes('@') ? 'email' : 'phone';
-      const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
-      console.log('Fetching customer URL for sizes:', customerUrl);
-      const customerResponse = await fetch(customerUrl, {
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-        }
-      });
-      if (!customerResponse.ok) throw new Error(await customerResponse.text());
-      const customerData = await customerResponse.json();
-      if (customerData.customers.length === 0) {
-        return res.status(404).json({ error: 'Customer not found with provided contact' });
-      }
-      const customerId = customerData.customers[0].id;
-
-      // Find the order
-      const ordersQuery = `customer_id:${customerId} name:#${encodeURIComponent(order_number)}`;
-      const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&limit=1`;
-      console.log('Fetching order URL for sizes:', ordersUrl);
-      const ordersResponse = await fetch(ordersUrl, {
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-        }
-      });
-      if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
-      const orderData = await ordersResponse.json();
-      if (!orderData.orders || orderData.orders.length === 0) {
-        return res.status(404).json({ error: 'Order not found' });
-      }
-      const order = orderData.orders[0];
-      const lineItem = (order.fulfillments && order.fulfillments.length > 0 ? order.fulfillments[0].line_items : order.line_items || []).find(item => item.id === parseInt(item_id));
-      if (!lineItem) {
-        return res.status(404).json({ error: 'Line item not found' });
-      }
-      const variantId = lineItem.variant_id;
-
-      // Fetch product variants (already includes sizes)
-      const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${lineItem.product_id}.json?fields=variants`;
-      console.log('Fetching product variants URL:', productUrl);
-      const productResponse = await fetch(productUrl, {
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-        }
-      });
-      if (!productResponse.ok) throw new Error(await productResponse.text());
-      const productData = await productResponse.json();
-      const variants = productData.product.variants || [];
-
-      // Fetch inventory levels for all variants
-      const inventoryUrl = `https://${storeDomain}/admin/api/2024-07/inventory_levels.json?variant_ids=${variants.map(v => v.id).join(',')}`;
-      console.log('Fetching inventory URL:', inventoryUrl);
-      const inventoryResponse = await fetch(inventoryUrl, {
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-        }
-      });
-      if (!inventoryResponse.ok) throw new Error(await inventoryResponse.text());
-      const inventoryData = await inventoryResponse.json();
-      const inventoryLevels = inventoryData.inventory_levels || [];
-
-      // Map sizes with availability using existing variants
-      const availableSizes = variants.map(variant => {
-        const inventoryLevel = inventoryLevels.find(il => il.variant_id === variant.id);
-        const available = inventoryLevel ? inventoryLevel.available > 0 : false;
-        return {
-          size: variant.option1 || variant.title, // Assuming size is in option1 or title
-          available
-        };
-      }).filter(size => size.size); // Filter out invalid sizes
-
-      res.json({ available_sizes: availableSizes });
-    } catch (err) {
-      console.error('Proxy error (get_available_sizes):', err.message);
-      res.status(500).json({ error: 'Failed to fetch available sizes: ' + err.message });
     }
     return;
   }
