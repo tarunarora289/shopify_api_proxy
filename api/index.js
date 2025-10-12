@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
 
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
-  const token = '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'; // Your working token (replace with new one if 401 persists)
+  const token = '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'; // Replace with new token if 401 persists
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
 
   // Handle POST request for exchange submission
@@ -77,21 +77,28 @@ module.exports = async (req, res) => {
         });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
         data = await ordersResponse.json();
-        // Fetch line_items with image_url for the first order
+        // Fetch product image for the first order's line items
         if (data.orders && data.orders.length > 0) {
-          const orderId = data.orders[0].id;
-          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}.json?fields=line_items{product_id,variant_id,title,variant_title,image_url}`;
-          console.log('Fetching line items URL:', lineItemsUrl);
-          const lineItemsResponse = await fetch(lineItemsUrl, {
-            headers: {
-              'X-Shopify-Access-Token': token,
-              'Content-Type': 'application/json',
-              'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+          const order = data.orders[0];
+          if (order.fulfillments && order.fulfillments.length > 0) {
+            const lineItems = order.fulfillments[0].line_items;
+            for (let item of lineItems) {
+              const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images`;
+              console.log('Fetching product image URL:', productUrl);
+              const productResponse = await fetch(productUrl, {
+                headers: {
+                  'X-Shopify-Access-Token': token,
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+                }
+              });
+              if (!productResponse.ok) throw new Error(await productResponse.text());
+              const productData = await productResponse.json();
+              if (productData.product && productData.product.images && productData.product.images.length > 0) {
+                item.image_url = productData.product.images[0].src; // Use the first image URL
+              }
             }
-          });
-          if (!lineItemsResponse.ok) throw new Error(await lineItemsResponse.text());
-          const lineItemsData = await lineItemsResponse.json();
-          data.orders[0].line_items = lineItemsData.order.line_items; // Add line_items to the first order
+          }
         }
       } else {
         const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
@@ -105,21 +112,28 @@ module.exports = async (req, res) => {
         });
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
-        // Fetch line_items with image_url for the first order
+        // Fetch product image for the first order's line items
         if (data.orders && data.orders.length > 0) {
-          const orderId = data.orders[0].id;
-          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}.json?fields=line_items{product_id,variant_id,title,variant_title,image_url}`;
-          console.log('Fetching line items URL:', lineItemsUrl);
-          const lineItemsResponse = await fetch(lineItemsUrl, {
-            headers: {
-              'X-Shopify-Access-Token': token,
-              'Content-Type': 'application/json',
-              'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+          const order = data.orders[0];
+          if (order.fulfillments && order.fulfillments.length > 0) {
+            const lineItems = order.fulfillments[0].line_items;
+            for (let item of lineItems) {
+              const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images`;
+              console.log('Fetching product image URL:', productUrl);
+              const productResponse = await fetch(productUrl, {
+                headers: {
+                  'X-Shopify-Access-Token': token,
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+                }
+              });
+              if (!productResponse.ok) throw new Error(await productResponse.text());
+              const productData = await productResponse.json();
+              if (productData.product && productData.product.images && productData.product.images.length > 0) {
+                item.image_url = productData.product.images[0].src; // Use the first image URL
+              }
             }
-          });
-          if (!lineItemsResponse.ok) throw new Error(await lineItemsResponse.text());
-          const lineItemsData = await lineItemsResponse.json();
-          data.orders[0].line_items = lineItemsData.order.line_items; // Add line_items to the first order
+          }
         }
       }
       res.json(data);
