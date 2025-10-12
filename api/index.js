@@ -89,9 +89,13 @@ module.exports = async (req, res) => {
               'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
             }
           });
-          if (!orderResponse.ok) throw new Error(await orderResponse.text());
+          if (!orderResponse.ok) {
+            console.error('Order details fetch failed:', await orderResponse.text());
+            throw new Error(`Failed to fetch order details: ${orderResponse.status} - ${await orderResponse.text()}`);
+          }
           const orderData = await orderResponse.json();
-          data.orders[0] = orderData.order; // Replace the first order with detailed data
+          console.log('Order details response:', JSON.stringify(orderData, null, 2));
+          data.orders[0] = orderData.order; // Update the first order with detailed data
         }
       } else {
         const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
@@ -117,9 +121,13 @@ module.exports = async (req, res) => {
               'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
             }
           });
-          if (!orderResponse.ok) throw new Error(await orderResponse.text());
+          if (!orderResponse.ok) {
+            console.error('Order details fetch failed:', await orderResponse.text());
+            throw new Error(`Failed to fetch order details: ${orderResponse.status} - ${await orderResponse.text()}`);
+          }
           const orderData = await orderResponse.json();
-          data.orders[0] = orderData.order; // Replace the first order with detailed data
+          console.log('Order details response:', JSON.stringify(orderData, null, 2));
+          data.orders[0] = orderData.order; // Update the first order with detailed data
         }
       }
       res.json(data);
