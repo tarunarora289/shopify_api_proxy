@@ -77,6 +77,22 @@ module.exports = async (req, res) => {
         });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
         data = await ordersResponse.json();
+        // Fetch full order details including line_items for the first order
+        if (data.orders && data.orders.length > 0) {
+          const orderId = data.orders[0].id;
+          const orderUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}.json?fields=id,name,total_price,line_items{product_id,variant_id,title,variant_title,image_url}`;
+          console.log('Fetching order details URL:', orderUrl);
+          const orderResponse = await fetch(orderUrl, {
+            headers: {
+              'X-Shopify-Access-Token': token,
+              'Content-Type': 'application/json',
+              'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+            }
+          });
+          if (!orderResponse.ok) throw new Error(await orderResponse.text());
+          const orderData = await orderResponse.json();
+          data.orders[0] = orderData.order; // Replace the first order with detailed data
+        }
       } else {
         const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
         console.log('Fetching URL:', apiUrl);
@@ -89,6 +105,22 @@ module.exports = async (req, res) => {
         });
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
+        // Fetch full order details including line_items for the first order
+        if (data.orders && data.orders.length > 0) {
+          const orderId = data.orders[0].id;
+          const orderUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}.json?fields=id,name,total_price,line_items{product_id,variant_id,title,variant_title,image_url}`;
+          console.log('Fetching order details URL:', orderUrl);
+          const orderResponse = await fetch(orderUrl, {
+            headers: {
+              'X-Shopify-Access-Token': token,
+              'Content-Type': 'application/json',
+              'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+            }
+          });
+          if (!orderResponse.ok) throw new Error(await orderResponse.text());
+          const orderData = await orderResponse.json();
+          data.orders[0] = orderData.order; // Replace the first order with detailed data
+        }
       }
       res.json(data);
     } catch (err) {
