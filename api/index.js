@@ -66,7 +66,7 @@ module.exports = async (req, res) => {
         const customerId = customerData.customers[0].id;
         console.log('Found customer ID:', customerId);
         const ordersQuery = `customer_id:${customerId} name:#${encodeURIComponent(query)}`;
-        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&fields=id,name,total_price,line_items{product_id,variant_id,title,variant_title,image_url}&limit=10`;
+        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&limit=10`;
         console.log('Fetching orders URL:', ordersUrl);
         const ordersResponse = await fetch(ordersUrl, {
           headers: {
@@ -77,8 +77,24 @@ module.exports = async (req, res) => {
         });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
         data = await ordersResponse.json();
+        // Fetch line_items with image_url for the first order
+        if (data.orders && data.orders.length > 0) {
+          const orderId = data.orders[0].id;
+          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}/line_items.json?fields=product_id,variant_id,title,variant_title,image_url`;
+          console.log('Fetching line items URL:', lineItemsUrl);
+          const lineItemsResponse = await fetch(lineItemsUrl, {
+            headers: {
+              'X-Shopify-Access-Token': token,
+              'Content-Type': 'application/json',
+              'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+            }
+          });
+          if (!lineItemsResponse.ok) throw new Error(await lineItemsResponse.text());
+          const lineItemsData = await lineItemsResponse.json();
+          data.orders[0].line_items = lineItemsData.line_items; // Add line_items to the first order
+        }
       } else {
-        const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&fields=id,name,total_price,line_items{product_id,variant_id,title,variant_title,image_url}&limit=10`;
+        const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
         console.log('Fetching URL:', apiUrl);
         const response = await fetch(apiUrl, {
           headers: {
@@ -89,6 +105,22 @@ module.exports = async (req, res) => {
         });
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
+        // Fetch line_items with image_url for the first order
+        if (data.orders && data.orders.length > 0) {
+          const orderId = data.orders[0].id;
+          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}/line_items.json?fields=product_id,variant_id,title,variant_title,image_url`;
+          console.log('Fetching line items URL:', lineItemsUrl);
+          const lineItemsResponse = await fetch(lineItemsUrl, {
+            headers: {
+              'X-Shopify-Access-Token': token,
+              'Content-Type': 'application/json',
+              'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+            }
+          });
+          if (!lineItemsResponse.ok) throw new Error(await lineItemsResponse.text());
+          const lineItemsData = await lineItemsResponse.json();
+          data.orders[0].line_items = lineItemsData.line_items; // Add line_items to the first order
+        }
       }
       res.json(data);
     } catch (err) {
