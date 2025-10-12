@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
 
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
-  const token = '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'; // Your working token
+  const token = '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'; // Your working token (replace with new one if 401 persists)
   const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
 
   // Handle POST request for exchange submission
@@ -80,7 +80,7 @@ module.exports = async (req, res) => {
         // Fetch line_items with image_url for the first order
         if (data.orders && data.orders.length > 0) {
           const orderId = data.orders[0].id;
-          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}/line_items.json?fields=product_id,variant_id,title,variant_title,image_url`;
+          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}.json?fields=line_items{product_id,variant_id,title,variant_title,image_url}`;
           console.log('Fetching line items URL:', lineItemsUrl);
           const lineItemsResponse = await fetch(lineItemsUrl, {
             headers: {
@@ -91,7 +91,7 @@ module.exports = async (req, res) => {
           });
           if (!lineItemsResponse.ok) throw new Error(await lineItemsResponse.text());
           const lineItemsData = await lineItemsResponse.json();
-          data.orders[0].line_items = lineItemsData.line_items; // Add line_items to the first order
+          data.orders[0].line_items = lineItemsData.order.line_items; // Add line_items to the first order
         }
       } else {
         const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
@@ -108,7 +108,7 @@ module.exports = async (req, res) => {
         // Fetch line_items with image_url for the first order
         if (data.orders && data.orders.length > 0) {
           const orderId = data.orders[0].id;
-          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}/line_items.json?fields=product_id,variant_id,title,variant_title,image_url`;
+          const lineItemsUrl = `https://${storeDomain}/admin/api/2024-07/orders/${orderId}.json?fields=line_items{product_id,variant_id,title,variant_title,image_url}`;
           console.log('Fetching line items URL:', lineItemsUrl);
           const lineItemsResponse = await fetch(lineItemsUrl, {
             headers: {
@@ -119,7 +119,7 @@ module.exports = async (req, res) => {
           });
           if (!lineItemsResponse.ok) throw new Error(await lineItemsResponse.text());
           const lineItemsData = await lineItemsResponse.json();
-          data.orders[0].line_items = lineItemsData.line_items; // Add line_items to the first order
+          data.orders[0].line_items = lineItemsData.order.line_items; // Add line_items to the first order
         }
       }
       res.json(data);
