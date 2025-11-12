@@ -1,7 +1,7 @@
 const fetch = require('node-fetch');
 
+module:// Replace with your actual module.exports
 module.exports = async (req, res) => {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -16,7 +16,6 @@ module.exports = async (req, res) => {
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // POST: Submit Exchange
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     console.log('Processing exchange submission for customer_id:', customer_id);
     try {
@@ -39,7 +38,6 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // GET: Order Lookup
   if (req.method === 'GET') {
     if (!query) {
       return res.status(400).json({ error: 'Missing query parameter (order number)' });
@@ -86,12 +84,14 @@ module.exports = async (req, res) => {
         data = await response.json();
       }
 
-      // === ONLY CHANGE: Copy item.image → item.image_url ===
+      // === FINAL FIX: Expose product_id and variant_id ===
       if (data.orders && data.orders.length > 0) {
         const order = data.orders[0];
         const lineItems = (order.fulfillments?.[0]?.line_items) || order.line_items || [];
         for (let item of lineItems) {
-          item.image_url = item.image || 'https://via.placeholder.com/100';
+          item.product_id = item.product_id;
+          item.variant_id = item.variant_id;
+          item.image_url = item.image || null; // optional
         }
       }
 
