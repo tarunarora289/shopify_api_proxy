@@ -85,16 +85,16 @@ module.exports = async (req, res) => {
       }
 
       // === FINAL FIX: Expose product_id and variant_id ===
-      if (data.orders && data.orders.length > 0) {
-        const order = data.orders[0];
-        const lineItems = (order.fulfillments?.[0]?.line_items) || order.line_items || [];
-        for (let item of lineItems) {
-          item.product_id = item.product_id;
-          item.variant_id = item.variant_id;
-          item.image_url = item.image || null; // optional
-        }
-      }
-
+      // === FINAL FIX: Expose product_id + variant_id ===
+if (data.orders && data.orders.length > 0) {
+  const order = data.orders[0];
+  const lineItems = (order.fulfillments?.[0]?.line_items) || order.line_items || [];
+  for (let item of lineItems) {
+    item.product_id = item.product_id;
+    item.variant_id = item.variant_id;
+    item.image_url = item.image || null; // optional fallback
+  }
+}
       res.json(data);
     } catch (err) {
       console.error('Proxy error (GET):', err.message);
