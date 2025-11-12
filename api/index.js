@@ -86,12 +86,11 @@ module.exports = async (req, res) => {
         data = await response.json();
       }
 
-      // === ONLY CHANGE: Use line_item.image (already in response!) ===
+      // === ONLY CHANGE: Copy item.image → item.image_url ===
       if (data.orders && data.orders.length > 0) {
         const order = data.orders[0];
         const lineItems = (order.fulfillments?.[0]?.line_items) || order.line_items || [];
         for (let item of lineItems) {
-          // Use the image already included by Shopify
           item.image_url = item.image || 'https://via.placeholder.com/100';
         }
       }
