@@ -1,12 +1,11 @@
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  // Add CORS headers to allow Shopify page access
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Handle OPTIONS request for CORS preflight
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
@@ -17,7 +16,7 @@ module.exports = async (req, res) => {
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // Handle POST request for exchange submission
+  // POST: Submit Exchange
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     console.log('Processing exchange submission for customer_id:', customer_id);
     try {
@@ -40,7 +39,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // Handle GET request for order lookup
+  // GET: Order Lookup
   if (req.method === 'GET') {
     if (!query) {
       return res.status(400).json({ error: 'Missing query parameter (order number)' });
@@ -50,7 +49,6 @@ module.exports = async (req, res) => {
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
         const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
-        console.log('Fetching customers URL:', customerUrl);
         const customerResponse = await fetch(customerUrl, {
           headers: {
             'X-Shopify-Access-Token': token,
@@ -64,10 +62,8 @@ module.exports = async (req, res) => {
           return res.status(404).json({ error: 'Customer not found with provided contact' });
         }
         const customerId = customerData.customers[0].id;
-        console.log('Found customer ID:', customerId);
         const ordersQuery = `customer_id:${customerId} name:#${encodeURIComponent(query)}`;
         const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&limit=10`;
-        console.log('Fetching orders URL:', ordersUrl);
         const ordersResponse = await fetch(ordersUrl, {
           headers: {
             'X-Shopify-Access-Token': token,
@@ -77,43 +73,8 @@ module.exports = async (req, res) => {
         });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
         data = await ordersResponse.json();
-
-        // === IMAGE FETCH (SAFE) ===
-        if (data.orders && data.orders.length > 0) {
-          const order = data.orders[0];
-          if (order.fulfillments && order.fulfillments.length > 0) {
-            const lineItems = order.fulfillments[0].line_items;
-            for (let item of lineItems) {
-              if (!item.product_id) {
-                item.image_url = 'https://via.placeholder.com/100';
-                continue;
-              }
-              try {
-                const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images`;
-                console.log('Fetching product image URL:', productUrl);
-                const productResponse = await fetch(productUrl, {
-                  headers: {
-                    'X-Shopify-Access-Token': token,
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-                  }
-                });
-                if (productResponse.ok) {
-                  const productData = await productResponse.json();
-                  item.image_url = productData.product?.images?.[0]?.src || item.image || 'https://via.placeholder.com/100';
-                } else {
-                  item.image_url = item.image || 'https://via.placeholder.com/100';
-                }
-              } catch (imgErr) {
-                console.warn(`Image fetch failed for product ${item.product_id}:`, imgErr.message);
-                item.image_url = item.image || 'https://via.placeholder.com/100';
-              }
-            }
-          }
-        }
       } else {
         const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
-        console.log('Fetching URL:', apiUrl);
         const response = await fetch(apiUrl, {
           headers: {
             'X-Shopify-Access-Token': token,
@@ -123,41 +84,18 @@ module.exports = async (req, res) => {
         });
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
+      }
 
-        // === IMAGE FETCH (SAFE) ===
-        if (data.orders && data.orders.length > 0) {
-          const order = data.orders[0];
-          if (order.fulfillments && order.fulfillments.length > 0) {
-            const lineItems = order.fulfillments[0].line_items;
-            for (let item of lineItems) {
-              if (!item.product_id) {
-                item.image_url = 'https://via.placeholder.com/100';
-                continue;
-              }
-              try {
-                const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images`;
-                console.log('Fetching product image URL:', productUrl);
-                const productResponse = await fetch(productUrl, {
-                  headers: {
-                    'X-Shopify-Access-Token': token,
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-                  }
-                });
-                if (productResponse.ok) {
-                  const productData = await productResponse.json();
-                  item.image_url = productData.product?.images?.[0]?.src || item.image || 'https://via.placeholder.com/100';
-                } else {
-                  item.image_url = item.image || 'https://via.placeholder.com/100';
-                }
-              } catch (imgErr) {
-                console.warn(`Image fetch failed for product ${item.product_id}:`, imgErr.message);
-                item.image_url = item.image || 'https://via.placeholder.com/100';
-              }
-            }
-          }
+      // === ONLY CHANGE: Use line_item.image (already in response!) ===
+      if (data.orders && data.orders.length > 0) {
+        const order = data.orders[0];
+        const lineItems = (order.fulfillments?.[0]?.line_items) || order.line_items || [];
+        for (let item of lineItems) {
+          // Use the image already included by Shopify
+          item.image_url = item.image || 'https://via.placeholder.com/100';
         }
       }
+
       res.json(data);
     } catch (err) {
       console.error('Proxy error (GET):', err.message);
@@ -166,6 +104,5 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // Invalid method
   res.status(400).json({ error: 'Invalid request method' });
 };
