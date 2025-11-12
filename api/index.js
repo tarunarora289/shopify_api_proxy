@@ -1,27 +1,27 @@
 const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
-  // Add CORS headers to allow Shopify page access
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Handle OPTIONS request for CORS preflight
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
   }
 
-  const { query, contact } = req.query || {};
-  const { action, order, customer_id } = req.body || {};
-  const token = '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'; // Replace with new token if 401 persists
-  const storeDomain = 'trueweststore.myshopify.com'; // Confirmed domain
+  const { query, contact, action, order_number, item_id } = req.query || {};
+  const { action: bodyAction, order, customer_id } = req.body || {};
 
-  // Handle POST request for exchange submission
-  if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
-    console.log('Processing exchange submission for customer_id:', customer_id); // Debug log
+  const token = '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';
+  const storeDomain = 'trueweststore.myshopify.com';
+
+  /* ------------------- POST – Submit Exchange ------------------- */
+  if (req.method === 'POST' && bodyAction === 'submit_exchange' && order && customer_id) {
+    console.log('Processing exchange for customer_id:', customer_id);
     try {
-      const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
+      const resp = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
@@ -30,120 +30,119 @@ module.exports = async (req, res) => {
         },
         body: JSON.stringify(order)
       });
-      if (!response.ok) throw new Error(await response.text());
-      const data = await response.json();
-      res.json(data);
-    } catch (err) {
-      console.error('Proxy error (POST):', err.message); // Log full error
-      res.status(500).json({ error: 'Proxy failed (POST): ' + err.message });
+      if (!resp.ok) throw new Error(await resp.text());
+      res.json(await resp.json());
+    } catch (e) {
+      console.error('POST error:', e.message);
+      res.status(500).json({ error: 'POST failed: ' + e.message });
     }
     return;
   }
 
-  // Handle GET request for order lookup
-  if (req.method === 'GET') {
-    if (!query) {
-      return res.status(400).json({ error: 'Missing query parameter (order number)' });
-    }
+  /* ------------------- GET – Order Lookup + Images ------------------- */
+  if (req.method === 'GET' && query) {
+    if (!query) return res.status(400).json({ error: 'Missing query' });
+
     let data;
     try {
+      // ---- 1. Find customer (if contact supplied) ----
       if (contact) {
-        const contactField = contact.includes('@') ? 'email' : 'phone';
-        const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
-        console.log('Fetching customers URL:', customerUrl);
-        const customerResponse = await fetch(customerUrl, {
-          headers: {
-            'X-Shopify-Access-Token': token,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-          }
-        });
-        if (!customerResponse.ok) throw new Error(await customerResponse.text());
-        const customerData = await customerResponse.json();
-        if (customerData.customers.length === 0) {
-          return res.status(404).json({ error: 'Customer not found with provided contact' });
-        }
-        const customerId = customerData.customers[0].id;
-        console.log('Found customer ID:', customerId);
-        const ordersQuery = `customer_id:${customerId} name:#${encodeURIComponent(query)}`;
-        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=${encodeURIComponent(ordersQuery)}&limit=10`;
-        console.log('Fetching orders URL:', ordersUrl);
-        const ordersResponse = await fetch(ordersUrl, {
-          headers: {
-            'X-Shopify-Access-Token': token,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-          }
-        });
-        if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
-        data = await ordersResponse.json();
-        // Fetch product image for the first order's line items
-        if (data.orders && data.orders.length > 0) {
-          const order = data.orders[0];
-          if (order.fulfillments && order.fulfillments.length > 0) {
-            const lineItems = order.fulfillments[0].line_items;
-            for (let item of lineItems) {
-              const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images`;
-              console.log('Fetching product image URL:', productUrl);
-              const productResponse = await fetch(productUrl, {
-                headers: {
-                  'X-Shopify-Access-Token': token,
-                  'Content-Type': 'application/json',
-                  'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-                }
-              });
-              if (!productResponse.ok) throw new Error(await productResponse.text());
-              const productData = await productResponse.json();
-              if (productData.product && productData.product.images && productData.product.images.length > 0) {
-                item.image_url = productData.product.images[0].src; // Use the first image URL
-              }
-            }
-          }
-        }
+        const field = contact.includes('@') ? 'email' : 'phone';
+        const custUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${field}:${encodeURIComponent(contact)}`;
+        const custRes = await fetch(custUrl, { headers: { 'X-Shopify-Access-Token': token, 'User-Agent': 'Grok-Proxy/1.0' } });
+        if (!custRes.ok) throw new Error(await custRes.text());
+        const cust = await custRes.json();
+        if (!cust.customers.length) return res.status(404).json({ error: 'Customer not found' });
+
+        const custId = cust.customers[0].id;
+        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=customer_id:${custId} name:#${encodeURIComponent(query)}&limit=10`;
+        const ordRes = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token, 'User-Agent': 'Grok-Proxy/1.0' } });
+        if (!ordRes.ok) throw new Error(await ordRes.text());
+        data = await ordRes.json();
       } else {
         const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=name:#${encodeURIComponent(query)}&limit=10`;
-        console.log('Fetching URL:', apiUrl);
-        const response = await fetch(apiUrl, {
-          headers: {
-            'X-Shopify-Access-Token': token,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+        const resp = await fetch(apiUrl, { headers: { 'X-Shopify-Access-Token': token, 'User-Agent': 'Grok-Proxy/1.0' } });
+        if (!resp.ok) throw new Error(await resp.text());
+        data = await resp.json();
+      }
+
+      // ---- 2. Attach image_url to line items (both branches) ----
+      const attachImages = async (order) => {
+        const items = (order.fulfillments?.[0]?.line_items) || order.line_items || [];
+        for (const itm of items) {
+          if (!itm.product_id) {
+            itm.image_url = 'https://via.placeholder.com/100';
+            continue;
           }
-        });
-        if (!response.ok) throw new Error(await response.text());
-        data = await response.json();
-        // Fetch product image for the first order's line items
-        if (data.orders && data.orders.length > 0) {
-          const order = data.orders[0];
-          if (order.fulfillments && order.fulfillments.length > 0) {
-            const lineItems = order.fulfillments[0].line_items;
-            for (let item of lineItems) {
-              const productUrl = `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images`;
-              console.log('Fetching product image URL:', productUrl);
-              const productResponse = await fetch(productUrl, {
-                headers: {
-                  'X-Shopify-Access-Token': token,
-                  'Content-Type': 'application/json',
-                  'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
-                }
-              });
-              if (!productResponse.ok) throw new Error(await productResponse.text());
-              const productData = await productResponse.json();
-              if (productData.product && productData.product.images && productData.product.images.length > 0) {
-                item.image_url = productData.product.images[0].src; // Use the first image URL
-              }
+          try {
+            const prodUrl = `https://${storeDomain}/admin/api/2024-07/products/${itm.product_id}.json?fields=images`;
+            const prodRes = await fetch(prodUrl, { headers: { 'X-Shopify-Access-Token': token, 'User-Agent': 'Grok-Proxy/1.0' } });
+            if (prodRes.ok) {
+              const p = await prodRes.json();
+              itm.image_url = p.product?.images?.[0]?.src || itm.image || 'https://via.placeholder.com/100';
+            } else {
+              itm.image_url = itm.image || 'https://via.placeholder.com/100';
             }
+          } catch (e) {
+            console.warn(`Image fetch failed for ${itm.product_id}:`, e.message);
+            itm.image_url = itm.image || 'https://via.placeholder.com/100';
           }
         }
-      }
+      };
+
+      if (data.orders?.length) await attachImages(data.orders[0]);
+
       res.json(data);
-    } catch (err) {
-      console.error('Proxy error (GET):', err.message); // Log full error
-      res.status(500).json({ error: 'Failed to fetch from Shopify API: ' + err.message });
+    } catch (e) {
+      console.error('GET error:', e.message);
+      res.status(500).json({ error: 'GET failed: ' + e.message });
     }
     return;
   }
 
-  // Invalid method
-  res.status(400).json({ error: 'Invalid request method' });
+  /* ------------------- GET – Available Sizes (for exchange) ------------------- */
+  if (req.method === 'GET' && action === 'get_available_sizes' && order_number && contact && item_id) {
+    try {
+      // 1. Find customer
+      const field = contact.includes('@') ? 'email' : 'phone';
+      const custUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${field}:${encodeURIComponent(contact)}`;
+      const custRes = await fetch(custUrl, { headers: { 'X-Shopify-Access-Token': token } });
+      if (!custRes.ok) throw new Error(await custRes.text());
+      const cust = await custRes.json();
+      if (!cust.customers.length) return res.status(404).json({ error: 'Customer not found' });
+
+      const custId = cust.customers[0].id;
+
+      // 2. Find order
+      const ordUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&query=customer_id:${custId} name:#${encodeURIComponent(order_number)}&limit=1`;
+      const ordRes = await fetch(ordUrl, { headers: { 'X-Shopify-Access-Token': token } });
+      if (!ordRes.ok) throw new Error(await ordRes.text());
+      const ord = await ordRes.json();
+      if (!ord.orders?.length) return res.status(404).json({ error: 'Order not found' });
+
+      const lineItem = (ord.orders[0].fulfillments?.[0]?.line_items || ord.orders[0].line_items || [])
+        .find(i => i.id === parseInt(item_id));
+      if (!lineItem) return res.status(404).json({ error: 'Item not found' });
+
+      // 3. Get variants + inventory
+      const prodUrl = `https://${storeDomain}/admin/api/2024-07/products/${lineItem.product_id}.json?fields=variants`;
+      const prodRes = await fetch(prodUrl, { headers: { 'X-Shopify-Access-Token': token } });
+      if (!prodRes.ok) throw new Error(await prodRes.text());
+      const prod = await prodRes.json();
+
+      const sizes = (prod.product?.variants || []).map(v => ({
+        size: v.option1 || v.title,
+        available: (v.inventory_quantity || 0) > 0
+      })).filter(s => s.size);
+
+      res.json({ available_sizes: sizes });
+    } catch (e) {
+      console.error('Sizes error:', e.message);
+      res.status(500).json({ error: 'Sizes failed: ' + e.message });
+    }
+    return;
+  }
+
+  // Fallback
+  res.status(400).json({ error: 'Invalid request' });
 };
