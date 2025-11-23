@@ -1,9 +1,10 @@
-const fetch = require('node-fetch');
+  const fetch = require('node-fetch');
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
@@ -23,9 +24,8 @@ module.exports = async (req, res) => {
     console.log(`EXCHANGE: Creating replacement for ${order.name}`);
 
     try {
-      // Build line items for the NEW size/color the customer selected
       const newLineItems = (exchange_items || []).map(item => ({
-        variant_id: item.new_variant_id || item.variant_id,   // ← User selected new size
+        variant_id: item.new_variant_id || item.variant_id,
         quantity: item.quantity || 1,
         properties: [
           { name: "_Original Order", value: order.name },
@@ -35,53 +35,65 @@ module.exports = async (req, res) => {
         ]
       }));
 
-      // Create Draft Order (free exchange)
+      // Log draft order payload for debugging
+      const draftOrderPayload = {
+        draft_order: {
+          line_items: newLineItems,
+          customer: { id: order.customer.id },
+          email: order.email,
+          shipping_address: order.shipping_address,
+          billing_address: order.billing_address,
+          note: `EXCHANGE → Original Order: ${order.name} (Automated via Portal)`,
+          tags: "exchange, size-exchange, automated, customer-portal",
+          applied_discount: {
+            description: "Free Exchange – No Charge",
+            value_type: "percentage",
+            value: 100.0,
+            title: "100% Free Exchange"
+          },
+          note_attributes: [
+            { name: "Original Order", value: order.name },
+            { name: "RMA Type", value: "Exchange" },
+            { name: "Processed Via", value: "Customer Portal" }
+          ]
+        }
+      };
+
+      console.log('Draft order create payload:', JSON.stringify(draftOrderPayload, null, 2));
+
       const draftRes = await fetch(`https://${storeDomain}/admin/api/${apiVersion}/draft_orders.json`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          draft_order: {
-            line_items: newLineItems,
-            customer: { id: order.customer.id },
-            email: order.email,
-            shipping_address: order.shipping_address,
-            billing_address: order.billing_address,
-            note: `EXCHANGE → Original Order: ${order.name} (Automated via Portal)`,
-            tags: "exchange, size-exchange, automated, customer-portal",
-            applied_discount: {
-              description: "Free Exchange – No Charge",
-              value_type: "percentage",
-              value: 100.0,
-              amount: "0.00",
-              title: "100% Free Exchange"
-            },
-            note_attributes: [
-              { name: "Original Order", value: order.name },
-              { name: "RMA Type", value: "Exchange" },
-              { name: "Processed Via", value: "Customer Portal" }
-            ]
-          }
-        })
+        body: JSON.stringify(draftOrderPayload)
       });
 
       if (!draftRes.ok) {
-        const err = await draftRes.text();
-        throw new Error(`Draft order failed: ${err}`);
+        const errText = await draftRes.text();
+        console.error('Draft order creation failed:', errText);
+        throw new Error(`Draft order failed: ${errText}`);
       }
 
       const draft = await draftRes.json();
       const draftId = draft.draft_order.id;
 
       // Complete → Instantly creates REAL order
-      const completeRes = await fetch(`https://${storeDomain}/admin/api/${apiVersion}/draft_orders/${draftId}/complete.json?payment_status=paid`, {
+      const completeUrl = `https://${storeDomain}/admin/api/${apiVersion}/draft_orders/${draftId}/complete.json?payment_status=paid`;
+      const completeRes = await fetch(completeUrl, {
         method: 'PUT',
-        headers: { 'X-Shopify-Access-Token': token }
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        }
       });
 
-      if (!completeRes.ok) throw new Error(await completeRes.text());
+      if (!completeRes.ok) {
+        const errorText = await completeRes.text();
+        console.error('Draft order completion failed:', errorText);
+        throw new Error(`Complete failed: ${errorText}`);
+      }
 
       const result = await completeRes.json();
       const newOrder = result.draft_order;
@@ -121,7 +133,7 @@ module.exports = async (req, res) => {
             note: `RETURN → Original Order: ${order.name} (Customer Portal)`,
             notify: true,
             refund_line_items: return_items.map(item => ({
-              line_item_id: item.id,
+              line_item_id: parseInt(item.id),
               quantity: item.quantity || 1,
               restock_type: "return"
             }))
@@ -129,7 +141,11 @@ module.exports = async (req, res) => {
         })
       });
 
-      if (!refundRes.ok) throw new Error(await refundRes.text());
+      if (!refundRes.ok) {
+        const errText = await refundRes.text();
+        console.error('Refund creation failed:', errText);
+        throw new Error(`Refund failed: ${errText}`);
+      }
 
       const refundData = await refundRes.json();
 
@@ -173,9 +189,6 @@ module.exports = async (req, res) => {
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
       }
-
-      // ... [ALL YOUR ORIGINAL TRACKING, IMAGES, VARIANTS, eShipz LOGIC REMAINS 100% UNCHANGED BELOW] ...
-      // (I'm keeping it exactly as you had it — no changes)
 
       if (data.orders && data.orders.length > 0) {
         const cleanQuery = query.replace('#', '');
