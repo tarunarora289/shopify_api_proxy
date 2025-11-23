@@ -15,9 +15,8 @@ module.exports = async (req, res) => {
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // POST logic unchanged...
+  // POST logic (unchanged)
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
-    // ... your existing POST code
     console.log('Processing exchange submission for customer_id:', customer_id);
     try {
       const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
@@ -39,6 +38,7 @@ module.exports = async (req, res) => {
     return;
   }
 
+  // GET logic — with REAL delivery date from eShipz
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
 
@@ -52,7 +52,6 @@ module.exports = async (req, res) => {
         const customerData = await customerResponse.json();
         if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
         const customerId = customerData.customers[0].id;
-
         const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
         const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
@@ -75,7 +74,52 @@ module.exports = async (req, res) => {
 
       const order = data.orders[0];
 
-      // ADD DELIVERY DATE (estimated: created_at + 5–7 days)
+      // NEW: Fetch REAL delivery date from eShipz (Bluedart tracking)
+      let actualDeliveryDate = null;
+      const fulfillment = order.fulfillments?.[0];
+      if (fulfillment?.tracking_number) {
+        const awb = fulfillment.tracking_number.trim();
+        try {
+          const trackUrl = `https://track.eshipz.com/track?awb=${awb}`;
+          const trackRes = await fetch(trackUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            timeout: 8000
+          });
+          const html = await trackRes.text();
+
+          // Multiple date patterns to catch different formats
+          const patterns = [
+            /Delivered.*?(\d{2}\/\d{2}\/\d{4})/i,
+            /Delivered on.*?(\d{2}\/\d{2}\/\d{4})/i,
+            /Delivered.*?(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
+            /Delivered.*?(\d{4}-\d{2}-\d{2})/i
+          ];
+
+          for (const pattern of patterns) {
+            const match = html.match(pattern);
+            if (match) {
+              actualDeliveryDate = match[1];
+              break;
+            }
+          }
+        } catch (e) {
+          console.warn(`eShipz tracking failed for AWB ${awb}:`, e.message);
+        }
+      }
+
+      // Attach real delivery date (overrides pickup date issue)
+      if (actualDeliveryDate) {
+        order.actual_delivery_date = actualDeliveryDate;
+        // Use this in your returns.liquid to calculate eligibility
+        order.delivered_at = actualDeliveryDate;
+      } else {
+        order.actual_delivery_date = null;
+        order.delivered_at = fulfillment?.updated_at?.split('T')[0] || order.created_at.split('T')[0];
+      }
+
+      // Keep estimated delivery (optional)
       const created = new Date(order.created_at);
       const minDelivery = new Date(created);
       minDelivery.setDate(created.getDate() + 5);
@@ -88,7 +132,6 @@ module.exports = async (req, res) => {
 
       // ENHANCE LINE ITEMS WITH IMAGE + ALL VARIANTS + INVENTORY
       for (let item of order.line_items) {
-        // 1. Get product + variants with inventory
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
           { headers: { 'X-Shopify-Access-Token': token } }
@@ -96,12 +139,10 @@ module.exports = async (req, res) => {
         const productData = await productRes.json();
         const product = productData.product;
 
-        // Add main image
         if (product.images && product.images.length > 0) {
           item.image_url = product.images[0].src;
         }
 
-        // Add all available sizes + inventory for exchange dropdown
         item.available_variants = product.variants.map(v => ({
           id: v.id,
           title: v.title,
@@ -109,7 +150,6 @@ module.exports = async (req, res) => {
           available: v.inventory_quantity > 0
         }));
 
-        // Mark current variant
         const currentVariant = product.variants.find(v => v.id === item.variant_id);
         if (currentVariant) {
           item.current_size = currentVariant.title;
