@@ -38,7 +38,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // GET logic — with REAL delivery date from eShipz
+  // GET logic — with SMART Bluedart tracking (Delivered vs In Transit)
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
 
@@ -73,51 +73,70 @@ module.exports = async (req, res) => {
       }
 
       const order = data.orders[0];
-
-      // NEW: Fetch REAL delivery date from eShipz (Bluedart tracking)
-      let actualDeliveryDate = null;
       const fulfillment = order.fulfillments?.[0];
+
+      // NEW: Smart eShipz tracking — only set delivery date if ACTUALLY delivered
+      let actualDeliveryDate = null;
+      let currentShippingStatus = 'unknown';
+
       if (fulfillment?.tracking_number) {
         const awb = fulfillment.tracking_number.trim();
         try {
           const trackUrl = `https://track.eshipz.com/track?awb=${awb}`;
           const trackRes = await fetch(trackUrl, {
             headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
             },
-            timeout: 8000
+            timeout: 10000
           });
           const html = await trackRes.text();
 
-          // Multiple date patterns to catch different formats
-          const patterns = [
-            /Delivered.*?(\d{2}\/\d{2}\/\d{4})/i,
-            /Delivered on.*?(\d{2}\/\d{2}\/\d{4})/i,
-            /Delivered.*?(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
-            /Delivered.*?(\d{4}-\d{2}-\d{2})/i
-          ];
+          // First: Check if the word "Delivered" exists anywhere
+          if (html.toLowerCase().includes('delivered')) {
+            currentShippingStatus = 'Delivered';
 
-          for (const pattern of patterns) {
-            const match = html.match(pattern);
-            if (match) {
-              actualDeliveryDate = match[1];
-              break;
+            // Extract delivery date only if delivered
+            const patterns = [
+              /Delivered.*?(\d{2}\/\d{2}\/\d{4})/i,
+              /Delivered on.*?(\d{2}\/\d{2}\/\d{4})/i,
+              /Delivered.*?(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
+              /Delivered.*?(\d{4}-\d{2}-\d{2})/i
+            ];
+
+            for (const pattern of patterns) {
+              const match = html.match(pattern);
+              if (match) {
+                actualDeliveryDate = match[1];
+                break;
+              }
+            }
+          } else {
+            // Not delivered — detect current status
+            if (html.includes('In Transit') || html.includes('Out for Delivery') || html.includes('Shipped') || html.includes('Dispatched')) {
+              currentShippingStatus = 'In Transit';
+            } else if (html.includes('Picked Up') || html.includes('Pickup')) {
+              currentShippingStatus = 'Picked Up';
+            } else {
+              currentShippingStatus = 'Processing';
             }
           }
         } catch (e) {
           console.warn(`eShipz tracking failed for AWB ${awb}:`, e.message);
+          currentShippingStatus = 'Unknown';
         }
       }
 
-      // Attach real delivery date (overrides pickup date issue)
+      // Attach to order — only set delivery date if actually delivered
       if (actualDeliveryDate) {
         order.actual_delivery_date = actualDeliveryDate;
-        // Use this in your returns.liquid to calculate eligibility
         order.delivered_at = actualDeliveryDate;
       } else {
         order.actual_delivery_date = null;
-        order.delivered_at = fulfillment?.updated_at?.split('T')[0] || order.created_at.split('T')[0];
+        order.delivered_at = null; // Important: don't fall back to pickup date
       }
+
+      // Add current status for frontend
+      order.current_shipping_status = currentShippingStatus;
 
       // Keep estimated delivery (optional)
       const created = new Date(order.created_at);
@@ -139,21 +158,21 @@ module.exports = async (req, res) => {
         const productData = await productRes.json();
         const product = productData.product;
 
-        if (product.images && product.images.length > 0) {
+        if (product?.images?.[0]?.src) {
           item.image_url = product.images[0].src;
         }
 
-        item.available_variants = product.variants.map(v => ({
+        item.available_variants = (product?.variants || []).map(v => ({
           id: v.id,
           title: v.title,
-          inventory_quantity: v.inventory_quantity,
-          available: v.inventory_quantity > 0
+          inventory_quantity: v.inventory_quantity || 0,
+          available: (v.inventory_quantity || 0) > 0
         }));
 
-        const currentVariant = product.variants.find(v => v.id === item.variant_id);
+        const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
         if (currentVariant) {
           item.current_size = currentVariant.title;
-          item.current_inventory = currentVariant.inventory_quantity;
+          item.current_inventory = currentVariant.inventory_quantity || 0;
         }
       }
 
