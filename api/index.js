@@ -17,7 +17,7 @@ module.exports = async (req, res) => {
   const storeDomain = 'trueweststore.myshopify.com';
   const apiVersion = '2024-07';
 
-  // EXCHANGE: Create draft order and complete it
+  // EXCHANGE
   if (req.method === 'POST' && action === 'submit_exchange' && order && order.name && order.customer?.id) {
     console.log(`EXCHANGE: Creating replacement for ${order.name}`);
 
@@ -67,17 +67,28 @@ module.exports = async (req, res) => {
         body: JSON.stringify(draftOrderPayload)
       });
 
+      const draftText = await draftRes.text();
       if (!draftRes.ok) {
-        const errText = await draftRes.text();
-        console.error('Draft order creation failed:', errText);
-        res.status(500).json({ success: false, error: 'Draft order creation failed', details: errText });
+        console.error('Draft order creation failed:', draftText);
+        let errorData;
+        try {
+          errorData = JSON.parse(draftText);
+        } catch (e) {
+          errorData = { error: draftText };
+        }
+        res.status(draftRes.status).json({
+          success: false,
+          stage: 'draft_creation',
+          status: draftRes.status,
+          error: errorData
+        });
         return;
       }
 
-      const draft = await draftRes.json();
+      const draft = JSON.parse(draftText);
       const draftId = draft.draft_order.id;
 
-      // Complete draft order (create real order)
+      // Draft order completion
       const completeUrl = `https://${storeDomain}/admin/api/${apiVersion}/draft_orders/${draftId}/complete.json?payment_status=paid`;
       const completeRes = await fetch(completeUrl, {
         method: 'PUT',
@@ -87,14 +98,25 @@ module.exports = async (req, res) => {
         }
       });
 
+      const completeText = await completeRes.text();
       if (!completeRes.ok) {
-        const errorText = await completeRes.text();
-        console.error('Draft order completion failed:', errorText);
-        res.status(500).json({ success: false, error: 'Draft order completion failed', details: errorText });
+        console.error('Draft order completion failed:', completeText);
+        let errorData;
+        try {
+          errorData = JSON.parse(completeText);
+        } catch (e) {
+          errorData = { error: completeText };
+        }
+        res.status(completeRes.status).json({
+          success: false,
+          stage: 'draft_completion',
+          status: completeRes.status,
+          error: errorData
+        });
         return;
       }
 
-      const result = await completeRes.json();
+      const result = JSON.parse(completeText);
       const newOrder = result.draft_order;
 
       res.json({
@@ -111,11 +133,10 @@ module.exports = async (req, res) => {
       console.error("EXCHANGE ERROR:", err.message);
       res.status(500).json({ success: false, error: "Failed to create exchange", details: err.message });
     }
-
     return;
   }
 
-  // RETURN: Process refund
+  // RETURN
   if (req.method === 'POST' && action === 'submit_return' && return_items && order?.name && order?.id) {
     console.log(`RETURN: Processing refund for ${order.name}`);
 
@@ -139,14 +160,25 @@ module.exports = async (req, res) => {
         })
       });
 
+      const refundText = await refundRes.text();
       if (!refundRes.ok) {
-        const errText = await refundRes.text();
-        console.error('Refund creation failed:', errText);
-        res.status(500).json({ success: false, error: 'Refund creation failed', details: errText });
+        console.error('Refund creation failed:', refundText);
+        let errorData;
+        try {
+          errorData = JSON.parse(refundText);
+        } catch (e) {
+          errorData = { error: refundText };
+        }
+        res.status(refundRes.status).json({
+          success: false,
+          stage: 'refund_creation',
+          status: refundRes.status,
+          error: errorData
+        });
         return;
       }
 
-      const refundData = await refundRes.json();
+      const refundData = JSON.parse(refundText);
 
       res.json({
         success: true,
@@ -160,14 +192,12 @@ module.exports = async (req, res) => {
       console.error("RETURN ERROR:", err.message);
       res.status(500).json({ success: false, error: "Failed to process return", details: err.message });
     }
-
     return;
   }
 
-  // GET order (original logic)
+  // GET ORDER logic (unchanged)
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
-
     let data;
     try {
       if (contact) {
