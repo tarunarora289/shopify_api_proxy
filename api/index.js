@@ -17,9 +17,7 @@ module.exports = async (req, res) => {
   const storeDomain = 'trueweststore.myshopify.com';
   const apiVersion = '2024-07';
 
-  // ================================================================
-  // 1. EXCHANGE — WORLD CLASS, 100% SUCCESS
-  // ================================================================
+  // EXCHANGE: Create draft order and complete it
   if (req.method === 'POST' && action === 'submit_exchange' && order && order.name && order.customer?.id) {
     console.log(`EXCHANGE: Creating replacement for ${order.name}`);
 
@@ -35,7 +33,6 @@ module.exports = async (req, res) => {
         ]
       }));
 
-      // Log draft order payload for debugging
       const draftOrderPayload = {
         draft_order: {
           line_items: newLineItems,
@@ -73,13 +70,14 @@ module.exports = async (req, res) => {
       if (!draftRes.ok) {
         const errText = await draftRes.text();
         console.error('Draft order creation failed:', errText);
-        throw new Error(`Draft order failed: ${errText}`);
+        res.status(500).json({ success: false, error: 'Draft order creation failed', details: errText });
+        return;
       }
 
       const draft = await draftRes.json();
       const draftId = draft.draft_order.id;
 
-      // Complete → Instantly creates REAL order
+      // Complete draft order (create real order)
       const completeUrl = `https://${storeDomain}/admin/api/${apiVersion}/draft_orders/${draftId}/complete.json?payment_status=paid`;
       const completeRes = await fetch(completeUrl, {
         method: 'PUT',
@@ -92,7 +90,8 @@ module.exports = async (req, res) => {
       if (!completeRes.ok) {
         const errorText = await completeRes.text();
         console.error('Draft order completion failed:', errorText);
-        throw new Error(`Complete failed: ${errorText}`);
+        res.status(500).json({ success: false, error: 'Draft order completion failed', details: errorText });
+        return;
       }
 
       const result = await completeRes.json();
@@ -112,12 +111,11 @@ module.exports = async (req, res) => {
       console.error("EXCHANGE ERROR:", err.message);
       res.status(500).json({ success: false, error: "Failed to create exchange", details: err.message });
     }
+
     return;
   }
 
-  // ================================================================
-  // 2. RETURN — FULL CASH REFUND
-  // ================================================================
+  // RETURN: Process refund
   if (req.method === 'POST' && action === 'submit_return' && return_items && order?.name && order?.id) {
     console.log(`RETURN: Processing refund for ${order.name}`);
 
@@ -144,7 +142,8 @@ module.exports = async (req, res) => {
       if (!refundRes.ok) {
         const errText = await refundRes.text();
         console.error('Refund creation failed:', errText);
-        throw new Error(`Refund failed: ${errText}`);
+        res.status(500).json({ success: false, error: 'Refund creation failed', details: errText });
+        return;
       }
 
       const refundData = await refundRes.json();
@@ -161,14 +160,14 @@ module.exports = async (req, res) => {
       console.error("RETURN ERROR:", err.message);
       res.status(500).json({ success: false, error: "Failed to process return", details: err.message });
     }
+
     return;
   }
 
-  // ================================================================
-  // 3. GET ORDER — YOUR ORIGINAL LOGIC (100% PRESERVED)
-  // ================================================================
+  // GET order (original logic)
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
+
     let data;
     try {
       if (contact) {
