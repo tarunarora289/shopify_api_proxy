@@ -15,16 +15,14 @@ module.exports = async (req, res) => {
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // POST logic (unchanged)
+  // POST — Exchange/Return Order Creation
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
-    console.log('Processing exchange submission for customer_id:', customer_id);
     try {
       const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
           'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
         },
         body: JSON.stringify(order)
       });
@@ -32,151 +30,132 @@ module.exports = async (req, res) => {
       const data = await response.json();
       res.json(data);
     } catch (err) {
-      console.error('Proxy error (POST):', err.message);
-      res.status(500).json({ error: 'Proxy failed (POST): ' + err.message });
+      console.error('POST Error:', err.message);
+      res.status(500).json({ error: 'Failed to create order' });
     }
     return;
   }
 
-  // GET logic — with SMART Bluedart tracking (Delivered vs In Transit)
+  // GET — Order Lookup + Smart Bluedart Tracking
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
 
     let data;
     try {
+      // Step 1: Find order by number + optional email/phone
       if (contact) {
-        const contactField = contact.includes('@') ? 'email' : 'phone';
-        const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
-        const customerResponse = await fetch(customerUrl, { headers: { 'X-Shopify-Access-Token': token } });
-        if (!customerResponse.ok) throw new Error(await customerResponse.text());
-        const customerData = await customerResponse.json();
-        if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
-        const customerId = customerData.customers[0].id;
-        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
-        const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
-        if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
-        data = await ordersResponse.json();
+        const field = contact.includes('@') ? 'email' : 'phone';
+        const custRes = await fetch(`https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${field}:${encodeURIComponent(contact)}`, {
+          headers: { 'X-Shopify-Access-Token': token }
+        });
+        const custData = await custRes.json();
+        if (custData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
+        const cid = custData.customers[0].id;
+        const ordRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${cid}&name=#${query}&limit=1`, {
+          headers: { 'X-Shopify-Access-Token': token }
+        });
+        data = await ordRes.json();
       } else {
-        const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&name=#${query}&limit=1`;
-        const response = await fetch(apiUrl, { headers: { 'X-Shopify-Access-Token': token } });
-        if (!response.ok) throw new Error(await response.text());
-        data = await response.json();
+        const ordRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?status=any&name=#${query}&limit=1`, {
+          headers: { 'X-Shopify-Access-Token': token }
+        });
+        data = await ordRes.json();
       }
 
-      // ENSURE ONLY ONE ORDER
-      if (data.orders && data.orders.length > 0) {
-        const cleanQuery = query.replace('#', '');
-        const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
-        data.orders = exactOrder ? [exactOrder] : [data.orders[0]];
-      } else {
-        return res.status(404).json({ error: 'Order not found' });
-      }
+      if (!data.orders || data.orders.length === 0) return res.status(404).json({ error: 'Order not found' });
 
       const order = data.orders[0];
       const fulfillment = order.fulfillments?.[0];
 
-      // NEW: Smart eShipz tracking — only set delivery date if ACTUALLY delivered
+      // Step 2: Smart eShipz (Bluedart) tracking — ONLY mark as Delivered if real delivery date exists
       let actualDeliveryDate = null;
-      let currentShippingStatus = 'unknown';
+      let currentShippingStatus = 'Processing';
 
       if (fulfillment?.tracking_number) {
         const awb = fulfillment.tracking_number.trim();
         try {
-          const trackUrl = `https://track.eshipz.com/track?awb=${awb}`;
-          const trackRes = await fetch(trackUrl, {
+          const trackRes = await fetch(`https://track.eshipz.com/track?awb=${awb}`, {
             headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             },
             timeout: 10000
           });
           const html = await trackRes.text();
 
-          // First: Check if the word "Delivered" exists anywhere
-          if (html.toLowerCase().includes('delivered')) {
-            currentShippingStatus = 'Delivered';
+          let isActuallyDelivered = false;
 
-            // Extract delivery date only if delivered
+          // Look for "Delivered" + real date
+          if (/delivered/i.test(html)) {
             const patterns = [
               /Delivered.*?(\d{2}\/\d{2}\/\d{4})/i,
               /Delivered on.*?(\d{2}\/\d{2}\/\d{4})/i,
-              /Delivered.*?(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
+              /Delivered.*?(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i,
               /Delivered.*?(\d{4}-\d{2}-\d{2})/i
             ];
 
-            for (const pattern of patterns) {
-              const match = html.match(pattern);
-              if (match) {
-                actualDeliveryDate = match[1];
+            for (const p of patterns) {
+              const m = html.match(p);
+              if (m) {
+                actualDeliveryDate = m[1];
+                isActuallyDelivered = true;
                 break;
               }
             }
-          } else {
-            // Not delivered — detect current status
-            if (html.includes('In Transit') || html.includes('Out for Delivery') || html.includes('Shipped') || html.includes('Dispatched')) {
-              currentShippingStatus = 'In Transit';
-            } else if (html.includes('Picked Up') || html.includes('Pickup')) {
-              currentShippingStatus = 'Picked Up';
-            } else {
-              currentShippingStatus = 'Processing';
-            }
           }
+
+          // Final status decision
+          if (isActuallyDelivered) {
+            currentShippingStatus = 'Delivered';
+          } else if (/(in transit|out for delivery|dispatched|shipped)/i.test(html)) {
+            currentShippingStatus = 'In Transit';
+          } else if (/(picked up|manifested|pickup)/i.test(html)) {
+            currentShippingStatus = 'Picked Up';
+          } else {
+            currentShippingStatus = 'Processing';
+          }
+
         } catch (e) {
-          console.warn(`eShipz tracking failed for AWB ${awb}:`, e.message);
+          console.warn(`eShipz failed for AWB ${awb}:`, e.message);
           currentShippingStatus = 'Unknown';
         }
       }
 
-      // Attach to order — only set delivery date if actually delivered
+      // Attach ONLY if truly delivered
       if (actualDeliveryDate) {
         order.actual_delivery_date = actualDeliveryDate;
         order.delivered_at = actualDeliveryDate;
       } else {
         order.actual_delivery_date = null;
-        order.delivered_at = null; // Important: don't fall back to pickup date
+        order.delivered_at = null;
       }
 
-      // Add current status for frontend
       order.current_shipping_status = currentShippingStatus;
 
-      // Keep estimated delivery (optional)
+      // Estimated delivery (optional)
       const created = new Date(order.created_at);
-      const minDelivery = new Date(created);
-      minDelivery.setDate(created.getDate() + 5);
-      const maxDelivery = new Date(created);
-      maxDelivery.setDate(created.getDate() + 7);
-      order.estimated_delivery = {
-        min: minDelivery.toISOString().split('T')[0],
-        max: maxDelivery.toISOString().split('T')[0]
-      };
+      const min = new Date(created); min.setDate(created.getDate() + 5);
+      const max = new Date(created); max.setDate(created.getDate() + 7);
+      order.estimated_delivery = { min: min.toISOString().split('T')[0], max: max.toISOString().split('T')[0] };
 
-      // ENHANCE LINE ITEMS WITH IMAGE + ALL VARIANTS + INVENTORY
+      // Enhance line items
       for (let item of order.line_items) {
-        const productRes = await fetch(
-          `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
-          { headers: { 'X-Shopify-Access-Token': token } }
-        );
-        const productData = await productRes.json();
-        const product = productData.product;
-
-        if (product?.images?.[0]?.src) {
-          item.image_url = product.images[0].src;
-        }
-
-        item.available_variants = (product?.variants || []).map(v => ({
+        const prodRes = await fetch(`https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=images,variants`, {
+          headers: { 'X-Shopify-Access-Token': token }
+        });
+        const prodData = await prodRes.json();
+        const p = prodData.product;
+        item.image_url = p?.images?.[0]?.src || '';
+        item.available_variants = (p?.variants || []).map(v => ({
           id: v.id,
           title: v.title,
-          inventory_quantity: v.inventory_quantity || 0,
-          available: (v.inventory_quantity || 0) > 0
+          available: v.inventory_quantity > 0
         }));
-
-        const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
-        if (currentVariant) {
-          item.current_size = currentVariant.title;
-          item.current_inventory = currentVariant.inventory_quantity || 0;
-        }
+        const curVar = p?.variants?.find(v => v.id === item.variant_id);
+        if (curVar) item.current_size = curVar.title;
       }
 
       res.json(data);
+
     } catch (err) {
       console.error('Proxy error:', err.message);
       res.status(500).json({ error: err.message });
