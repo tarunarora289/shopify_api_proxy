@@ -15,65 +15,62 @@ module.exports = async (req, res) => {
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // ==================== EXCHANGE: Fixed with Draft Orders (Free Replacement) ====================
+  // ==================== EXCHANGE: 100% FIXED WITH DRAFT ORDERS ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
-    console.log('Processing exchange submission for customer_id:', customer_id);
+    console.log('Processing EXCHANGE for customer_id:', customer_id);
+
     try {
-      // Step 1: Create FREE Draft Order
       const draftResponse = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders.json`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
           'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+          'User-Agent': 'Grok-Proxy/1.0'
         },
         body: JSON.stringify({
           draft_order: {
             line_items: order.line_items || [],
             customer: { id: customer_id },
             email: order.email,
-            shipping_address: order.shipping_address || order.customer?.default_address,
-            billing_address: order.billing_address || order.customer?.default_address,
-            note: `EXCHANGE for Order ${order.name} | Customer Portal`,
-            tags: "exchange,customer-portal",
+            shipping_address: order.shipping_address || null,
+            billing_address: order.billing_address || null,
+            note: `EXCHANGE - Original Order: ${order.name} | Created via Customer Portal`,
+            tags: "exchange,size-exchange,customer-portal",
             applied_discount: {
-              description: "Exchange - Free Replacement",
+              description: "Free Exchange Replacement",
               value_type: "percentage",
               value: 100.0,
               amount: "0.00",
-              title: "Exchange - 100% Free"
+              title: "100% Exchange Discount"
             },
             note_attributes: [
               { name: "Original Order", value: order.name },
-              { name: "Type", value: "Exchange" }
+              { name: "RMA Type", value: "Exchange" }
             ]
           }
         })
       });
 
       if (!draftResponse.ok) {
-        const err = await draftResponse.text();
-        throw new Error(`Draft order failed: ${err}`);
+        const errorText = await draftResponse.text();
+        throw new Error(`Draft order creation failed: ${errorText}`);
       }
 
       const draftData = await draftResponse.json();
-      const draftOrder = draftData.draft_order;
+      const draftOrderId = draftData.draft_order.id;
 
-      // Step 2: Complete as Paid (Free)
+      // Complete the draft order as paid (free)
       const completeResponse = await fetch(
-        `https://${storeDomain}/admin/api/2024-07/draft_orders/${draftOrder.id}/complete.json?payment_status=paid`,
+        `https://${storeDomain}/admin/api/2024-07/draft_orders/${draftOrderId}/complete.json?payment_status=paid`,
         {
           method: 'PUT',
-          headers: {
-            'X-Shopify-Access-Token': token,
-            'Content-Type': 'application/json'
-          }
+          headers: { 'X-Shopify-Access-Token': token }
         }
       );
 
       if (!completeResponse.ok) {
-        const err = await completeResponse.text();
-        throw new Error(`Failed to complete draft order: ${err}`);
+        const errorText = await completeResponse.text();
+        throw new Error(`Failed to complete draft order: ${errorText}`);
       }
 
       const completed = await completeResponse.json();
@@ -84,83 +81,100 @@ module.exports = async (req, res) => {
         exchange_order: {
           id: completed.draft_order.order_id,
           name: completed.draft_order.name,
-          admin_url: `https://${storeDomain}/admin/orders/${completed.draft_order.order_id}`
+          admin_url: `https://${storeDomain}/admin/orders/${completed.draft_order.order_id}`,
+          customer_message: "Your exchange has been processed. We'll ship the new item soon!"
         }
       });
 
     } catch (err) {
-      console.error('Proxy error (Exchange):', err.message);
-      res.status(500).json({ error: 'Failed to create exchange order', details: err.message });
+      console.error('EXCHANGE ERROR:', err.message);
+      res.status(500).json({
+        success: false,
+        error: "Failed to create exchange order",
+        details: err.message
+      });
     }
     return;
   }
 
-  // ==================== RETURN: Real Shopify Refund (Cash Back) ====================
+  // ==================== RETURN: FULL REFUND TO ORIGINAL PAYMENT ====================
   if (req.method === 'POST' && action === 'submit_return' && return_items && original_order_name) {
-    console.log('Processing return & refund for order:', original_order_name);
+    console.log('Processing RETURN & REFUND for order:', original_order_name);
 
     try {
       // Find the original order
-      const orderRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${original_order_name}&status=any&limit=1`, {
-        headers: { 'X-Shopify-Access-Token': token }
-      });
-      if (!orderRes.ok) throw new Error('Order not found');
-      const ordersData = await orderRes.json();
-      const shopifyOrder = ordersData.orders[0];
-      if (!shopifyOrder) throw new Error('Order not found');
+      const orderResponse = await fetch(
+        `https://${storeDomain}/admin/api/2024-07/orders.json?name=${original_order_name}&status=any&limit=1`,
+        { headers: { 'X-Shopify-Access-Token': token } }
+      );
 
-      const totalRefund = return_items.reduce((sum, item) => sum + (parseFloat(item.price) * item.quantity), 0).toFixed(2);
+      if (!orderResponse.ok) throw new Error("Could not fetch order");
+      const orderData = await orderResponse.json();
+      const shopifyOrder = orderData.orders?.[0];
 
-      const refundResponse = await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${shopifyOrder.id}/refunds.json`, {
-        method: 'POST',
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          refund: {
-            note: "Return processed via customer portal",
-            notify: true,
-            refund_line_items: return_items.map(item => ({
-              line_item_id: item.line_item_id,
-              quantity: item.quantity,
-              restock_type: "return"
-            })),
-            transactions: [{
-              kind: "refund",
-              amount: totalRefund,
-              currency: shopifyOrder.currency,
-              gateway: shopifyOrder.gateway || "manual",
-              status: "success"
-            }]
-          }
-        })
-      });
+      if (!shopifyOrder) {
+        return res.status(404).json({ success: false, error: "Order not found" });
+      }
+
+      const refundAmount = return_items.reduce((sum, item) => sum + (item.price * item.quantity), 0).toFixed(2);
+
+      const refundResponse = await fetch(
+        `https://${storeDomain}/admin/api/2024-07/orders/${shopifyOrder.id}/refunds.json`,
+        {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': token,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            refund: {
+              note: "Return processed via customer portal",
+              notify: true,
+              refund_line_items: return_items.map(item => ({
+                line_item_id: item.line_item_id,
+                quantity: item.quantity,
+                restock_type: "return"
+              })),
+              transactions: [{
+                kind: "refund",
+                amount: refundAmount,
+                currency: shopifyOrder.currency,
+                gateway: shopifyOrder.gateway || "manual",
+                status: "success"
+              }]
+            }
+          })
+        }
+      );
 
       if (!refundResponse.ok) {
-        const err = await refundResponse.text();
-        throw new Error(`Refund failed: ${err}`);
+        const errorText = await refundResponse.text();
+        throw new Error(`Refund API failed: ${errorText}`);
       }
 
       const refundResult = await refundResponse.json();
 
       res.json({
         success: true,
-        message: "Return accepted & refund processed!",
-        refund_amount: totalRefund,
+        message: "Return accepted! Refund processed.",
+        refund_amount: refundAmount,
         currency: shopifyOrder.currency,
         refund_id: refundResult.refund.id,
-        instructions: "Your refund will be processed to your original payment method within 3-5 business days."
+        customer_message: "Your refund will be processed to your original payment method within 3-7 business days."
       });
 
     } catch (err) {
-      console.error('Proxy error (Return):', err.message);
-      res.status(500).json({ error: 'Failed to process return', details: err.message });
+      console.error('RETURN ERROR:', err.message);
+      res.status(500).json({
+        success: false,
+        error: "Failed to process return",
+        details: err.message
+      });
     }
     return;
   }
 
-  // ==================== GET ORDER: YOUR ORIGINAL LOGIC (UNCHANGED) ====================
+  // ==================== ORIGINAL GET LOGIC (100% UNCHANGED) ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
