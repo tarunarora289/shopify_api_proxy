@@ -1,9 +1,10 @@
-// api/index.js → FINAL VERSION (Nov 2025) – 100% WORKING
+// api/index.js  →  FINAL VERSION (Original ↔ Replacement Detection + Product Display)
 
 import { Shopify } from '@shopify/shopify-api';
 
 const shop = process.env.SHOPIFY_SHOP;
 const accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
+
 const client = new Shopify.Clients.Rest(shop, accessToken);
 
 export default async function handler(req, res) {
@@ -11,21 +12,30 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
 
   const { query, contact, with_related } = req.query;
-  if (!query || !contact) return res.status(400).json({ error: 'Missing params' });
+
+  if (!query || !contact) {
+    return res.status(400).json({ error: 'Missing query or contact' });
+  }
 
   try {
-    // 1. Find orders by number
+    // Step 1: Find orders matching the order number
     const ordersRes = await client.get({
       path: 'orders',
-      query: { name: query.replace('#', ''), status: 'any', limit: 100 },
+      query: {
+        name: query.replace('#', ''),
+        status: 'any',
+        limit: 100,
+      },
     });
 
     let orders = ordersRes.body.orders || [];
 
-    // 2. Filter by email/phone
+    // Step 2: Filter by email or phone
     const search = contact.toLowerCase().replace(/[^\w@.+]/g, '');
     orders = orders.filter(o => {
       const email = (o.email || '').toLowerCase();
@@ -33,8 +43,11 @@ export default async function handler(req, res) {
       return email.includes(search) || phone.includes(search);
     });
 
-    if (orders.length === 0) return res.json({ orders: [] });
+    if (orders.length === 0) {
+      return res.json({ orders: [] });
+    }
 
+    // Sort newest first
     orders.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     const mainOrder = orders[0];
 
@@ -48,39 +61,56 @@ export default async function handler(req, res) {
     const tags = (mainOrder.tags || '').toLowerCase();
     const note = (mainOrder.note || '').toLowerCase();
 
-    // CASE A: Original order → already exchanged
+    // CASE 1: This is the ORIGINAL order → has exchange-processed tag
     if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
       response.already_processed = true;
 
-      const relatedRes = await client.get({ path: 'orders', query: { limit: 50 } });
-      const all = relatedRes.body.orders || [];
-      const replacement = all.find(o => o.note && o.note.toLowerCase().includes(mainOrder.name.toLowerCase()));
+      // Find replacement order by note containing original order number
+      const searchNote = mainOrder.name.toLowerCase();
+      const relatedRes = await client.get({
+        path: 'orders',
+        query: { limit: 50 },
+      });
+
+      const allOrders = relatedRes.body.orders || [];
+      const replacement = allOrders.find(o =>
+        o.note && o.note.toLowerCase().includes(searchNote)
+      );
 
       if (replacement) {
         response.exchange_order_name = replacement.name;
-        if (with_related === '1') response.related_order = formatOrder(replacement);
+        if (with_related === '1') {
+          response.related_order = formatOrder(replacement);
+        }
       }
     }
 
-    // CASE B: This IS the replacement order
-    else if (note.includes('exchange for order') || note.includes('replacement') || note.includes('portal')) {
+    // CASE 2: This is the REPLACEMENT order → note contains "exchange for order #XXXX"
+    else if (note.includes('exchange for order') || note.includes('replacement') || note.includes('portal exchange')) {
       const match = mainOrder.note.match(/#?(\d{4,})/);
       if (match) {
-        const origNum = match[1];
-        const origRes = await client.get({ path: 'orders', query: { name: origNum, limit: 1 } });
-        const original = origRes.body.orders?.[0];
-        if (original && with_related === '1') response.related_order = formatOrder(original);
+        const originalNum = match[1];
+        const originalRes = await client.get({
+          path: 'orders',
+          query: { name: originalNum, limit: 1 },
+        });
+
+        const original = originalRes.body.orders?.[0];
+        if (original && with_related === '1') {
+          response.related_order = formatOrder(original);
+        }
       }
     }
 
     res.json(response);
 
   } catch (error) {
-    console.error('Proxy error:', error);
-    res.status(500).json({ error: 'Server error' });
+    console.error('Proxy Error:', error);
+    res.status(500).json({ error: 'Server error', message: error.message });
   }
 }
 
+// Helper: Clean order data for frontend
 function formatOrder(order) {
   return {
     id: order.id,
