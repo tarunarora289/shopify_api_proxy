@@ -225,9 +225,8 @@ else if (note.includes('exchange for') || note.includes('portal')) {
       data.related_order = origData.orders[0];
     }
   }
-}
 // === END DUPLICATE PROTECTION ===
-      res.json(data);
+    } res.json(data);
     } catch (err) {
       console.error('Proxy error:', err.message);
       res.status(500).json({ error: err.message });
