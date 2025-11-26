@@ -15,11 +15,9 @@ module.exports = async (req, res) => {
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // POST logic — ONLY THIS BLOCK IS UPDATED
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     console.log('Processing exchange submission for customer_id:', customer_id);
     try {
-      // FIXED: Add note + tags + paid status
       const enhancedOrder = {
         ...order,
         note: `EXCHANGE for Order ${order.name} | Customer Portal`,
@@ -34,13 +32,12 @@ module.exports = async (req, res) => {
           'Content-Type': 'application/json',
           'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
         },
-        body: JSON.stringify({ order: enhancedOrder })  // ← wrapped in { order: ... }
+        body: JSON.stringify({ order: enhancedOrder })
       });
 
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json();
 
-      // FIXED: Tag original order as processed
       const origName = order.name;
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${origName}`, {
         headers: { 'X-Shopify-Access-Token': token }
@@ -56,7 +53,6 @@ module.exports = async (req, res) => {
         });
       }
 
-      // FIXED: Return proper success format
       res.json({
         success: true,
         message: "Exchange created successfully!",
@@ -70,10 +66,11 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ====== EVERYTHING BELOW IS 100% UNCHANGED (YOUR ORIGINAL CODE) ======
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
+    let customerId = null;
+
     try {
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
@@ -82,7 +79,7 @@ module.exports = async (req, res) => {
         if (!customerResponse.ok) throw new Error(await customerResponse.text());
         const customerData = await customerResponse.json();
         if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
-        const customerId = customerData.customers[0].id;
+        customerId = customerData.customers[0].id;
         const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
         const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
@@ -93,6 +90,7 @@ module.exports = async (req, res) => {
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
       }
+
       if (data.orders && data.orders.length > 0) {
         const cleanQuery = query.replace('#', '');
         const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
@@ -100,18 +98,18 @@ module.exports = async (req, res) => {
       } else {
         return res.status(404).json({ error: 'Order not found' });
       }
+
       const order = data.orders[0];
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
+
       if (fulfillment?.tracking_number) {
         const awb = fulfillment.tracking_number.trim();
         try {
           const trackUrl = `https://track.eshipz.com/track?awb=${awb}`;
           const trackRes = await fetch(trackUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
             timeout: 10000
           });
           const html = await trackRes.text();
@@ -147,6 +145,7 @@ module.exports = async (req, res) => {
           currentShippingStatus = 'Unknown';
         }
       }
+
       if (actualDeliveryDate) {
         order.actual_delivery_date = actualDeliveryDate;
         order.delivered_at = actualDeliveryDate;
@@ -155,6 +154,7 @@ module.exports = async (req, res) => {
         order.delivered_at = null;
       }
       order.current_shipping_status = currentShippingStatus;
+
       const created = new Date(order.created_at);
       const minDelivery = new Date(created);
       minDelivery.setDate(created.getDate() + 5);
@@ -164,6 +164,7 @@ module.exports = async (req, res) => {
         min: minDelivery.toISOString().split('T')[0],
         max: maxDelivery.toISOString().split('T')[0]
       };
+
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -186,14 +187,10 @@ module.exports = async (req, res) => {
           item.current_inventory = currentVariant.inventory_quantity;
         }
       }
-      // ADD THIS ENTIRE BLOCK AFTER YOUR EXISTING GET LOGIC (before final res.json(data))
 
-/ === DUPLICATE PROTECTION LOGIC === (SAFE VERSION)
+      // DUPLICATE PROTECTION — SAFE & WORKING
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-
-      // Safely get customerId — it's defined in the if(contact) block above
-      const customerId = contact ? customerData.customers[0].id : null;
 
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
         if (customerId) {
@@ -201,9 +198,7 @@ module.exports = async (req, res) => {
             headers: { 'X-Shopify-Access-Token': token }
           });
           const allOrders = (await allOrdersRes.json()).orders || [];
-          const replacement = allOrders.find(o =>
-            o.note && o.note.toLowerCase().includes(order.name.toLowerCase())
-          );
+          const replacement = allOrders.find(o => o.note && o.note.toLowerCase().includes(order.name.toLowerCase()));
           if (replacement) {
             data.already_processed = true;
             data.exchange_order_name = replacement.name;
@@ -229,8 +224,9 @@ module.exports = async (req, res) => {
           }
         }
       }
-      // === END DUPLICATE PROTECTION ===
-    } res.json(data);
+
+      res.json(data);
+
     } catch (err) {
       console.error('Proxy error:', err.message);
       res.status(500).json({ error: err.message });
