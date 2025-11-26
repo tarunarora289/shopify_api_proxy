@@ -188,7 +188,6 @@ module.exports = async (req, res) => {
         }
       }
 
-      // DUPLICATE PROTECTION — SAFE & WORKING
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
 
