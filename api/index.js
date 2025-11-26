@@ -188,44 +188,48 @@ module.exports = async (req, res) => {
       }
       // ADD THIS ENTIRE BLOCK AFTER YOUR EXISTING GET LOGIC (before final res.json(data))
 
-// === DUPLICATE PROTECTION LOGIC ===
-const tags = (order.tags || '').toLowerCase();
-const note = (order.note || '').toLowerCase();
+/ === DUPLICATE PROTECTION LOGIC === (SAFE VERSION)
+      const tags = (order.tags || '').toLowerCase();
+      const note = (order.note || '').toLowerCase();
 
-// Check if this is an ORIGINAL order that was already exchanged
-if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
-  const allOrdersRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
-    headers: { 'X-Shopify-Access-Token': token }
-  });
-  const allOrders = (await allOrdersRes.json()).orders || [];
+      // Safely get customerId — it's defined in the if(contact) block above
+      const customerId = contact ? customerData.customers[0].id : null;
 
-  const replacement = allOrders.find(o => 
-    o.note && o.note.toLowerCase().includes(order.name.toLowerCase())
-  );
-
-  if (replacement) {
-    data.already_processed = true;
-    data.exchange_order_name = replacement.name;
-    data.related_order = replacement;
-  } else {
-    data.already_processed = true;
-    data.exchange_order_name = "Processed";
-  }
-}
-
-// Check if this IS a replacement order
-else if (note.includes('exchange for') || note.includes('portal')) {
-  const match = note.match(/#(\d+)/i);
-  if (match) {
-    const originalRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, {
-      headers: { 'X-Shopify-Access-Token': token }
-    });
-    const origData = await originalRes.json();
-    if (origData.orders?.[0]) {
-      data.related_order = origData.orders[0];
-    }
-  }
-// === END DUPLICATE PROTECTION ===
+      if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
+        if (customerId) {
+          const allOrdersRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
+            headers: { 'X-Shopify-Access-Token': token }
+          });
+          const allOrders = (await allOrdersRes.json()).orders || [];
+          const replacement = allOrders.find(o =>
+            o.note && o.note.toLowerCase().includes(order.name.toLowerCase())
+          );
+          if (replacement) {
+            data.already_processed = true;
+            data.exchange_order_name = replacement.name;
+            data.related_order = replacement;
+          } else {
+            data.already_processed = true;
+            data.exchange_order_name = "Processed";
+          }
+        } else {
+          data.already_processed = true;
+          data.exchange_order_name = "Processed";
+        }
+      }
+      else if (note.includes('exchange for') || note.includes('portal')) {
+        const match = note.match(/#(\d+)/i);
+        if (match) {
+          const originalRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, {
+            headers: { 'X-Shopify-Access-Token': token }
+          });
+          const origData = await originalRes.json();
+          if (origData.orders?.[0]) {
+            data.related_order = origData.orders[0];
+          }
+        }
+      }
+      // === END DUPLICATE PROTECTION ===
     } res.json(data);
     } catch (err) {
       console.error('Proxy error:', err.message);
