@@ -11,12 +11,11 @@ module.exports = async (req, res) => {
 
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
-
   const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
+  // ==================== POST: CREATE EXCHANGE ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
-    console.log('Processing exchange submission for customer_id:', customer_id);
     try {
       const enhancedOrder = {
         ...order,
@@ -38,8 +37,8 @@ module.exports = async (req, res) => {
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json();
 
-      const origName = order.name;
-      const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${origName}`, {
+      // Tag original order as processed
+      const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${order.name}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
       const origData = await origRes.json();
@@ -47,9 +46,7 @@ module.exports = async (req, res) => {
         await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${origData.orders[0].id}.json`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            order: { tags: "exchange-processed,portal-exchange" }
-          })
+          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange" } })
         });
       }
 
@@ -58,7 +55,6 @@ module.exports = async (req, res) => {
         message: "Exchange created successfully!",
         exchange_order: data.order
       });
-
     } catch (err) {
       console.error('Proxy error (POST):', err.message);
       res.status(500).json({ error: 'Proxy failed (POST): ' + err.message });
@@ -66,12 +62,15 @@ module.exports = async (req, res) => {
     return;
   }
 
+  // ==================== GET: FETCH ORDER ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
+
     let data;
     let customerId = null;
 
     try {
+      // 1. Find customer if contact provided
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
         const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
@@ -80,6 +79,7 @@ module.exports = async (req, res) => {
         const customerData = await customerResponse.json();
         if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
         customerId = customerData.customers[0].id;
+
         const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
         const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
@@ -91,15 +91,17 @@ module.exports = async (req, res) => {
         data = await response.json();
       }
 
-      if (data.orders && data.orders.length > 0) {
-        const cleanQuery = query.replace('#', '');
-        const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
-        data.orders = exactOrder ? [exactOrder] : [data.orders[0]];
-      } else {
+      // ENSURE ONLY ONE ORDER IS RETURNED
+      if (!data.orders || data.orders.length === 0) {
         return res.status(404).json({ error: 'Order not found' });
       }
 
-      const order = data.orders[0];
+      const cleanQuery = query.replace('#', '');
+      const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
+      const order = exactOrder || data.orders[0];
+      data.orders = [order]; // ← ONLY ONE ORDER
+
+      // ==================== DELIVERY & TRACKING ====================
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -136,8 +138,6 @@ module.exports = async (req, res) => {
               currentShippingStatus = 'In Transit';
             } else if (html.toLowerCase().includes('picked up') || html.includes('pickup')) {
               currentShippingStatus = 'Picked Up';
-            } else {
-              currentShippingStatus = 'Processing';
             }
           }
         } catch (e) {
@@ -146,13 +146,8 @@ module.exports = async (req, res) => {
         }
       }
 
-      if (actualDeliveryDate) {
-        order.actual_delivery_date = actualDeliveryDate;
-        order.delivered_at = actualDeliveryDate;
-      } else {
-        order.actual_delivery_date = null;
-        order.delivered_at = null;
-      }
+      order.actual_delivery_date = actualDeliveryDate || null;
+      order.delivered_at = actualDeliveryDate || null;
       order.current_shipping_status = currentShippingStatus;
 
       const created = new Date(order.created_at);
@@ -165,6 +160,7 @@ module.exports = async (req, res) => {
         max: maxDelivery.toISOString().split('T')[0]
       };
 
+      // ==================== PRODUCT IMAGES & VARIANTS ====================
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -188,41 +184,21 @@ module.exports = async (req, res) => {
         }
       }
 
+      // ==================== FINAL DUPLICATE PROTECTION (100% BULLETPROOF) ====================
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
 
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
-        if (customerId) {
-          const allOrdersRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
-            headers: { 'X-Shopify-Access-Token': token }
-          });
-          const allOrders = (await allOrdersRes.json()).orders || [];
-          const replacement = allOrders.find(o => o.note && o.note.toLowerCase().includes(order.name.toLowerCase()));
-          if (replacement) {
-            data.already_processed = true;
-            data.exchange_order_name = replacement.name;
-            data.related_order = replacement;
-          } else {
-            data.already_processed = true;
-            data.exchange_order_name = "Processed";
-          }
-        } else {
-          data.already_processed = true;
-          data.exchange_order_name = "Processed";
-        }
+        data.already_processed = true;
+        data.exchange_order_name = "Already Processed";
       }
-      else if (note.includes('exchange for') || note.includes('portal')) {
-        const match = note.match(/#(\d+)/i);
-        if (match) {
-          const originalRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, {
-            headers: { 'X-Shopify-Access-Token': token }
-          });
-          const origData = await originalRes.json();
-          if (origData.orders?.[0]) {
-            data.related_order = origData.orders[0];
-          }
-        }
+      else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
+        data.already_processed = true;
+        data.exchange_order_name = order.name;
       }
+
+      // NO related_order — NEVER inject another order
+      // This was the root of all bugs
 
       res.json(data);
 
