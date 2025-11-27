@@ -46,7 +46,8 @@ module.exports = async (req, res) => {
         await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${origData.orders[0].id}.json`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange" } })
+          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange,
+            note: `EXCHANGED → New Order: ${data.order.name}`" } })
         });
       }
 
@@ -91,17 +92,17 @@ module.exports = async (req, res) => {
         data = await response.json();
       }
 
-      // ENSURE ONLY ONE ORDER IS RETURNED
       if (!data.orders || data.orders.length === 0) {
         return res.status(404).json({ error: 'Order not found' });
       }
 
+      // ENSURE ONLY ONE ORDER IS RETURNED
       const cleanQuery = query.replace('#', '');
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
-      data.orders = [order]; // ← ONLY ONE ORDER
+      data.orders = [order];
 
-      // ==================== DELIVERY & TRACKING ====================
+      // ==================== TRACKING & DELIVERY DATE ====================
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -184,21 +185,47 @@ module.exports = async (req, res) => {
         }
       }
 
-      // ==================== FINAL DUPLICATE PROTECTION (100% BULLETPROOF) ====================
+      // ==================== FINAL DUPLICATE PROTECTION + REFERENCE (PERFECT) ====================
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
 
+      // Case 1: Original order → show replacement
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
-        data.already_processed = true;
-        data.exchange_order_name = "Already Processed";
+        if (customerId) {
+          const allRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
+            headers: { 'X-Shopify-Access-Token': token }
+          });
+          const all = (await allRes.json()).orders || [];
+          const replacement = all.find(o => o.note && o.note.toLowerCase().includes(order.name.toLowerCase()));
+          if (replacement) {
+            data.already_processed = true;
+            data.exchange_order_name = replacement.name;
+            data.related_order = replacement;
+          } else {
+            data.already_processed = true;
+            data.exchange_order_name = "Processed";
+          }
+        } else {
+          data.already_processed = true;
+          data.exchange_order_name = "Processed";
+        }
       }
+      // Case 2: Replacement order → show original
       else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
         data.already_processed = true;
         data.exchange_order_name = order.name;
-      }
 
-      // NO related_order — NEVER inject another order
-      // This was the root of all bugs
+        const match = note.match(/exchange for [#]?(\d+)/i);
+        if (match) {
+          const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, {
+            headers: { 'X-Shopify-Access-Token': token }
+          });
+          const origData = await origRes.json();
+          if (origData.orders?.[0]) {
+            data.related_order = origData.orders[0];
+          }
+        }
+      }
 
       res.json(data);
 
