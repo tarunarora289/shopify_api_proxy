@@ -46,8 +46,8 @@ module.exports = async (req, res) => {
         await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${origData.orders[0].id}.json`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange,
-            note: `EXCHANGED → New Order: ${data.order.name}`" } })
+          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange",
+            note: `EXCHANGED → New Order: ${data.order.name}` } })
         });
       }
 
