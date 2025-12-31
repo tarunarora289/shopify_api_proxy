@@ -11,7 +11,7 @@ module.exports = async (req, res) => {
 
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
-  const token = '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';
+  const token = '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';
   const storeDomain = 'trueweststore.myshopify.com';
 
   // ==================== POST: CREATE EXCHANGE ====================
