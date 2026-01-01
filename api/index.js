@@ -1,5 +1,4 @@
 const fetch = require('node-fetch');
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -8,22 +7,26 @@ module.exports = async (req, res) => {
     res.status(200).end();
     return;
   }
-
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
-
   // ==================== POST: CREATE EXCHANGE ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     try {
+      // FIXED: Clean payload using currentOrder for addresses/email + frontend line_items
       const enhancedOrder = {
-        ...order,
-        note: `EXCHANGE for Order ${order.name} | Customer Portal`,
-        tags: "exchange-order,portal-created",
-        financial_status: "paid"
+        line_items: order.order.line_items || [],
+        customer: { id: customer_id },
+        email: currentOrder.email,
+        shipping_address: currentOrder.shipping_address,
+        billing_address: currentOrder.billing_address || currentOrder.shipping_address,
+        financial_status: "paid",
+        send_receipt: true,
+        send_fulfillment_receipt: false,
+        note: `EXCHANGE for Order ${currentOrder.name} | Customer Portal`,
+        tags: "exchange-order,portal-created"
       };
-
       const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
         method: 'POST',
         headers: {
@@ -33,10 +36,8 @@ module.exports = async (req, res) => {
         },
         body: JSON.stringify({ order: enhancedOrder })
       });
-
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json();
-
       // Tag original order as processed
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${order.name}`, {
         headers: { 'X-Shopify-Access-Token': token }
@@ -50,7 +51,6 @@ module.exports = async (req, res) => {
             note: `EXCHANGED → New Order: ${data.order.name}` } })
         });
       }
-
       res.json({
         success: true,
         message: "Exchange created successfully!",
@@ -62,14 +62,11 @@ module.exports = async (req, res) => {
     }
     return;
   }
-
   // ==================== GET: FETCH ORDER ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
-
     let data;
     let customerId = null;
-
     try {
       // 1. Find customer if contact provided
       if (contact) {
@@ -80,7 +77,6 @@ module.exports = async (req, res) => {
         const customerData = await customerResponse.json();
         if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
         customerId = customerData.customers[0].id;
-
         const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
         const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
@@ -91,22 +87,18 @@ module.exports = async (req, res) => {
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
       }
-
       if (!data.orders || data.orders.length === 0) {
         return res.status(404).json({ error: 'Order not found' });
       }
-
       // ENSURE ONLY ONE ORDER IS RETURNED
       const cleanQuery = query.replace('#', '');
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
-
       // ==================== TRACKING & DELIVERY DATE ====================
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
-
       if (fulfillment?.tracking_number) {
         const awb = fulfillment.tracking_number.trim();
         try {
@@ -146,11 +138,9 @@ module.exports = async (req, res) => {
           currentShippingStatus = 'Unknown';
         }
       }
-
       order.actual_delivery_date = actualDeliveryDate || null;
       order.delivered_at = actualDeliveryDate || null;
       order.current_shipping_status = currentShippingStatus;
-
       const created = new Date(order.created_at);
       const minDelivery = new Date(created);
       minDelivery.setDate(created.getDate() + 5);
@@ -160,7 +150,6 @@ module.exports = async (req, res) => {
         min: minDelivery.toISOString().split('T')[0],
         max: maxDelivery.toISOString().split('T')[0]
       };
-
       // ==================== PRODUCT IMAGES & VARIANTS ====================
       for (let item of order.line_items) {
         const productRes = await fetch(
@@ -184,11 +173,9 @@ module.exports = async (req, res) => {
           item.current_inventory = currentVariant.inventory_quantity;
         }
       }
-
       // ==================== FINAL DUPLICATE PROTECTION + REFERENCE (PERFECT) ====================
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-
       // Case 1: Original order → show replacement
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
         if (customerId) {
@@ -214,7 +201,6 @@ module.exports = async (req, res) => {
       else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
         data.already_processed = true;
         data.exchange_order_name = order.name;
-
         const match = note.match(/exchange for [#]?(\d+)/i);
         if (match) {
           const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, {
@@ -226,15 +212,12 @@ module.exports = async (req, res) => {
           }
         }
       }
-
       res.json(data);
-
     } catch (err) {
       console.error('Proxy error:', err.message);
       res.status(500).json({ error: err.message });
     }
     return;
   }
-
   res.status(400).json({ error: 'Invalid request' });
 };
