@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -7,10 +8,12 @@ module.exports = async (req, res) => {
     res.status(200).end();
     return;
   }
+
   const { query, contact } = req.query || {};
   const { action, order, customer_id, order_id, return_items } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
+
   // ==================== POST: SUBMIT RETURN REQUEST ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
@@ -24,6 +27,7 @@ module.exports = async (req, res) => {
           }
         })
       });
+
       res.json({
         success: true,
         message: "Return request created successfully!"
@@ -34,24 +38,33 @@ module.exports = async (req, res) => {
     }
     return;
   }
+
   // ==================== POST: CREATE EXCHANGE DRAFT ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
       const isCustom = !order.order.line_items[0].variant_id;
+
       // 1. Check previous exchanges for fee
       const customerOrdersRes = await fetch(
         `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags`,
         { headers: { 'X-Shopify-Access-Token': token } }
       );
       const customerOrders = (await customerOrdersRes.json()).orders || [];
-      const previousExchanges = customerOrders.filter(o => (o.tags || '').toLowerCase().includes('exchange-processed')).length;
+      const previousExchanges = customerOrders.filter(o => 
+        (o.tags || '').toLowerCase().includes('exchange-processed')
+      ).length;
       const addFee = previousExchanges > 0;
-      // 2. Get prices and details
+
+      // 2. Get original line item details
       const frontendLineItem = order.order.line_items[0];
       const originalPrice = parseFloat(frontendLineItem.price || 0);
       let newPrice = originalPrice;
       let variantTitle = 'Custom Size Item';
+      let productId = frontendLineItem.product_id;
+      let productTitle = frontendLineItem.title || 'Custom Item';
+      let productImage = 'https://via.placeholder.com/80';
+
       if (frontendLineItem.variant_id) {
         const variantRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/variants/${frontendLineItem.variant_id}.json`,
@@ -63,26 +76,51 @@ module.exports = async (req, res) => {
           variantTitle = variantData.variant.title || 'Selected Size';
         }
       }
-      // 3. Custom measurements note
+
+      // 3. For custom — fetch original product title & image
+      if (isCustom && productId) {
+        const productRes = await fetch(
+          `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
+          { headers: { 'X-Shopify-Access-Token': token } }
+        );
+        if (productRes.ok) {
+          const prodData = await productRes.json();
+          const product = prodData.product;
+          productTitle = product.title;
+          productImage = product.images?.[0]?.src || productImage;
+        }
+      }
+
+      // 4. Custom measurements note
       let customNote = '';
+      let customProperties = {};
       if (isCustom && order.order.custom_measurements) {
         const m = order.order.custom_measurements;
         customNote = ` | Custom: Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`;
+        customProperties = {
+          "Custom Measurements": `Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`
+        };
       }
-      // 4. Calculate total additional
+
+      // 5. Calculate total additional
       let totalAdditional = newPrice - originalPrice;
       if (addFee) totalAdditional += 200;
-      // 5. Build line items
+
+      // 6. Build line items — USE ORIGINAL PRODUCT IMAGE/TITLE FOR CUSTOM
       const draftLineItems = [
         {
+          product_id: productId,
           variant_id: frontendLineItem.variant_id || null,
           quantity: 1,
           price: newPrice.toFixed(2),
-          title: variantTitle,
+          title: isCustom ? `${productTitle} - Custom Size` : variantTitle,
+          name: isCustom ? `${productTitle} - Custom Size` : variantTitle,
+          properties: isCustom ? customProperties : {},
           taxable: true,
           requires_shipping: true
         }
       ];
+
       const priceDiff = newPrice - originalPrice;
       if (priceDiff !== 0) {
         draftLineItems.push({
@@ -92,6 +130,7 @@ module.exports = async (req, res) => {
           taxable: false
         });
       }
+
       if (addFee) {
         draftLineItems.push({
           title: "Exchange Fee",
@@ -100,10 +139,12 @@ module.exports = async (req, res) => {
           taxable: false
         });
       }
-      // 6. Tags
+
+      // 7. Tags
       let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested,exchange-in-progress";
       if (isCustom) draftTags += ",custom-size-exchange";
-      // 7. Create draft
+
+      // 8. Create draft
       const draftPayload = {
         draft_order: {
           line_items: draftLineItems,
@@ -116,6 +157,7 @@ module.exports = async (req, res) => {
           requires_shipping: true
         }
       };
+
       const draftRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders.json`, {
         method: 'POST',
         headers: {
@@ -127,7 +169,8 @@ module.exports = async (req, res) => {
       if (!draftRes.ok) throw new Error(await draftRes.text());
       const draftData = await draftRes.json();
       const draftId = draftData.draft_order.id;
-      // 8. Payment or auto-complete
+
+      // 9. Payment or auto-complete
       if (totalAdditional <= 0) {
         const completeRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/complete.json?payment_pending=true`, {
           method: 'PUT',
@@ -155,7 +198,8 @@ module.exports = async (req, res) => {
         const invoiceData = await invoiceRes.json();
         res.json({ success: true, payment_url: invoiceData.draft_order.invoice_url });
       }
-      // 9. Tag original
+
+      // 10. Tag original
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${originalOrderName}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
@@ -172,19 +216,20 @@ module.exports = async (req, res) => {
           })
         });
       }
+
     } catch (err) {
       console.error('Proxy error (POST):', err.message);
       res.status(500).json({ error: 'Exchange failed: ' + err.message });
     }
     return;
   }
+
   // ==================== GET: FETCH ORDER ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
     let customerId = null;
     try {
-      // 1. Find customer if contact provided
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
         const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
@@ -206,12 +251,11 @@ module.exports = async (req, res) => {
       if (!data.orders || data.orders.length === 0) {
         return res.status(404).json({ error: 'Order not found' });
       }
-      // ENSURE ONLY ONE ORDER IS RETURNED
       const cleanQuery = query.replace('#', '');
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
-      // ==================== TRACKING & DELIVERY DATE ====================
+
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -266,7 +310,6 @@ module.exports = async (req, res) => {
         min: minDelivery.toISOString().split('T')[0],
         max: maxDelivery.toISOString().split('T')[0]
       };
-      // ==================== PRODUCT IMAGES & VARIANTS ====================
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -274,22 +317,19 @@ module.exports = async (req, res) => {
         );
         const productData = await productRes.json();
         const product = productData.product;
-        if (product.images && product.images.length > 0) {
-          item.image_url = product.images[0].src;
-        }
-        item.available_variants = product.variants.map(v => ({
+        item.image_url = product?.images?.[0]?.src || 'https://via.placeholder.com/80';
+        item.available_variants = product?.variants?.map(v => ({
           id: v.id,
           title: v.title,
           inventory_quantity: v.inventory_quantity,
           available: v.inventory_quantity > 0
-        }));
-        const currentVariant = product.variants.find(v => v.id === item.variant_id);
+        })) || [];
+        const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
         if (currentVariant) {
           item.current_size = currentVariant.title;
           item.current_inventory = currentVariant.inventory_quantity;
         }
       }
-      // ==================== FINAL DUPLICATE PROTECTION + REFERENCE (PERFECT) ====================
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
       // Case 1: Original order → show replacement
