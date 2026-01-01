@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -7,41 +8,52 @@ module.exports = async (req, res) => {
     res.status(200).end();
     return;
   }
+
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
-  // ==================== POST: CREATE EXCHANGE ====================
+
+  // ==================== POST: CREATE EXCHANGE DRAFT ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     try {
+      const originalOrderName = order.name || 'Unknown Order';
+
       // 1. Check previous exchanges for fee
-      const customerOrdersRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags,name`, {
-        headers: { 'X-Shopify-Access-Token': token }
-      });
+      const customerOrdersRes = await fetch(
+        `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags`,
+        { headers: { 'X-Shopify-Access-Token': token } }
+      );
       if (!customerOrdersRes.ok) throw new Error(await customerOrdersRes.text());
       const customerOrders = (await customerOrdersRes.json()).orders || [];
-      const previousExchanges = customerOrders.filter(o => (o.tags || '').toLowerCase().includes('exchange-processed')).length;
-      const addExchangeFee = previousExchanges > 0; // First free
+      const previousExchanges = customerOrders.filter(o => 
+        (o.tags || '').toLowerCase().includes('exchange-processed')
+      ).length;
+      const addFee = previousExchanges > 0;
 
-      // 2. Calculate price difference
+      // 2. Get prices from frontend payload
       const frontendLineItem = order.order.line_items[0];
-      const originalPrice = parseFloat(currentOrder.line_items[0].price);
-      let newPrice = 0;
+      const originalPrice = parseFloat(frontendLineItem.price || 0);
+      let newPrice = originalPrice; // default for custom
       let variantTitle = 'Custom Size Item';
 
       if (frontendLineItem.variant_id) {
-        const variantRes = await fetch(`https://${storeDomain}/admin/api/2024-07/variants/${frontendLineItem.variant_id}.json`, {
-          headers: { 'X-Shopify-Access-Token': token }
-        });
-        if (!variantRes.ok) throw new Error(await variantRes.text());
-        const variantData = await variantRes.json();
-        newPrice = parseFloat(variantData.variant.price);
-        variantTitle = variantData.variant.title;
-      } else {
-        newPrice = originalPrice; // Custom: same price
+        const variantRes = await fetch(
+          `https://${storeDomain}/admin/api/2024-07/variants/${frontendLineItem.variant_id}.json`,
+          { headers: { 'X-Shopify-Access-Token': token } }
+        );
+        if (variantRes.ok) {
+          const variantData = await variantRes.json();
+          newPrice = parseFloat(variantData.variant.price || originalPrice);
+          variantTitle = variantData.variant.title || 'Selected Size';
+        }
       }
 
-      // 3. Build line items
+      // 3. Calculate total additional amount
+      let totalAdditional = newPrice - originalPrice;
+      if (addFee) totalAdditional += 200;
+
+      // 4. Build line items
       const draftLineItems = [
         {
           variant_id: frontendLineItem.variant_id || null,
@@ -52,26 +64,19 @@ module.exports = async (req, res) => {
         }
       ];
 
-      const priceDifference = newPrice - originalPrice;
-
-      if (priceDifference > 0) {
+      // Price difference line
+      const priceDiff = newPrice - originalPrice;
+      if (priceDiff !== 0) {
         draftLineItems.push({
-          title: "Price Difference",
-          price: priceDifference.toFixed(2),
-          quantity: 1,
-          taxable: false
-        });
-      } else if (priceDifference < 0) {
-        // Add discount line for refund
-        draftLineItems.push({
-          title: "Price Adjustment Refund",
-          price: priceDifference.toFixed(2), // negative
+          title: priceDiff > 0 ? "Price Difference" : "Price Adjustment Refund",
+          price: priceDiff.toFixed(2),
           quantity: 1,
           taxable: false
         });
       }
 
-      if (addExchangeFee) {
+      // Exchange fee
+      if (addFee) {
         draftLineItems.push({
           title: "Exchange Fee",
           price: "200.00",
@@ -80,7 +85,7 @@ module.exports = async (req, res) => {
         });
       }
 
-      // 4. Create draft order
+      // 5. Create draft order
       const draftPayload = {
         draft_order: {
           line_items: draftLineItems,
@@ -88,7 +93,7 @@ module.exports = async (req, res) => {
           email: order.order.email,
           shipping_address: order.order.shipping_address,
           billing_address: order.order.billing_address || order.order.shipping_address,
-          note: `EXCHANGE for Order ${order.name} | Portal Request | Draft ID: pending`,
+          note: `EXCHANGE for Order ${originalOrderName} | Portal Request`,
           tags: "exchange-draft,portal-created"
         }
       };
@@ -97,34 +102,34 @@ module.exports = async (req, res) => {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'User-Agent': 'TrueWest-Portal/1.0'
         },
         body: JSON.stringify(draftPayload)
       });
 
-      if (!draftRes.ok) throw new Error(await draftRes.text());
+      if (!draftRes.ok) {
+        const errText = await draftRes.text();
+        throw new Error(`Draft creation failed: ${errText}`);
+      }
+
       const draftData = await draftRes.json();
       const draftId = draftData.draft_order.id;
 
-      // 5. If no payment needed (priceDifference + fee = 0), complete draft automatically
-      const totalAdditional = priceDifference + (addExchangeFee ? 200 : 0);
+      // 6. Handle payment or auto-complete
       if (totalAdditional <= 0) {
+        // No payment needed — complete draft
         const completeRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/complete.json?payment_pending=true`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token }
         });
         if (!completeRes.ok) throw new Error(await completeRes.text());
         const completeData = await completeRes.json();
-        // Update note with new order number
-        await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${completeData.order.id}.json`, {
-          method: 'PUT',
-          headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order: { note: `EXCHANGE for Order ${order.name} | Portal Request | New Order: ${completeData.order.name}` } })
-        });
+
         res.json({
           success: true,
           exchange_order: completeData.order,
-          message: "Exchange created successfully!"
+          message: "Exchange created successfully (no payment required)!"
         });
       } else {
         // Send invoice for payment
@@ -137,11 +142,14 @@ module.exports = async (req, res) => {
           body: JSON.stringify({
             draft_order_invoice: {
               to: order.order.email,
-              subject: "Exchange Payment for Order " + order.name,
-              custom_message: "Please complete payment for your exchange. Total additional: ₹" + totalAdditional.toFixed(2) + (addExchangeFee ? " (incl. ₹200 fee)" : "")
+              subject: `Payment Required for Exchange - Order ${originalOrderName}`,
+              custom_message: `Hello!\n\nPlease pay ₹${totalAdditional.toFixed(2)} to complete your exchange.\n${
+                addFee ? "This includes a ₹200 exchange fee (first exchange is free).\n" : ""
+              }After payment, your replacement will be shipped within 2–3 days.\n\nThank you!\nTrue West Team`
             }
           })
         });
+
         if (!invoiceRes.ok) throw new Error(await invoiceRes.text());
         const invoiceData = await invoiceRes.json();
 
@@ -152,8 +160,8 @@ module.exports = async (req, res) => {
         });
       }
 
-      // 6. Tag original order as processed
-      const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${order.name}`, {
+      // 7. Tag original order as processed (prevents duplicates)
+      const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${originalOrderName}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
       const origData = await origRes.json();
@@ -161,13 +169,18 @@ module.exports = async (req, res) => {
         await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${origData.orders[0].id}.json`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange",
-            note: `EXCHANGED → Draft #${draftId}` } })
+          body: JSON.stringify({
+            order: {
+              tags: "exchange-processed,portal-exchange",
+              note: `EXCHANGE REQUESTED → Draft #${draftId}`
+            }
+          })
         });
       }
+
     } catch (err) {
       console.error('Proxy error (POST):', err.message);
-      res.status(500).json({ error: 'Proxy failed (POST): ' + err.message });
+      res.status(500).json({ error: 'Exchange failed: ' + err.message });
     }
     return;
   }
@@ -178,7 +191,6 @@ module.exports = async (req, res) => {
     let data;
     let customerId = null;
     try {
-      // 1. Find customer if contact provided
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
         const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
@@ -200,12 +212,10 @@ module.exports = async (req, res) => {
       if (!data.orders || data.orders.length === 0) {
         return res.status(404).json({ error: 'Order not found' });
       }
-      // ENSURE ONLY ONE ORDER IS RETURNED
       const cleanQuery = query.replace('#', '');
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
-      // ==================== TRACKING & DELIVERY DATE ====================
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -260,7 +270,6 @@ module.exports = async (req, res) => {
         min: minDelivery.toISOString().split('T')[0],
         max: maxDelivery.toISOString().split('T')[0]
       };
-      // ==================== PRODUCT IMAGES & VARIANTS ====================
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -283,10 +292,8 @@ module.exports = async (req, res) => {
           item.current_inventory = currentVariant.inventory_quantity;
         }
       }
-      // ==================== FINAL DUPLICATE PROTECTION + REFERENCE (PERFECT) ====================
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-      // Case 1: Original order → show replacement
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
         if (customerId) {
           const allRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
@@ -306,9 +313,7 @@ module.exports = async (req, res) => {
           data.already_processed = true;
           data.exchange_order_name = "Processed";
         }
-      }
-      // Case 2: Replacement order → show original
-      else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
+      } else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created') || tags.includes('exchange-draft')) {
         data.already_processed = true;
         data.exchange_order_name = order.name;
         const match = note.match(/exchange for [#]?(\d+)/i);
@@ -329,5 +334,6 @@ module.exports = async (req, res) => {
     }
     return;
   }
+
   res.status(400).json({ error: 'Invalid request' });
 };
