@@ -117,7 +117,7 @@ module.exports = async (req, res) => {
       }
 
       // 6. Tags
-      let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested";
+      let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested,exchange-in-progress";
       if (isCustom) draftTags += ",custom-size-exchange";
 
       // 7. Create draft
@@ -175,7 +175,7 @@ module.exports = async (req, res) => {
         res.json({ success: true, payment_url: invoiceData.draft_order.invoice_url });
       }
 
-      // 9. Tag original
+      // 9. Tag original — IMMEDIATE DUPLICATE BLOCK
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${originalOrderName}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
@@ -186,7 +186,7 @@ module.exports = async (req, res) => {
           headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             order: {
-              tags: "exchange-processed,portal-exchange",
+              tags: "exchange-processed,portal-exchange,exchange-in-progress",
               note: `EXCHANGE REQUESTED → Draft #${draftId}${customNote}`
             }
           })
@@ -232,7 +232,6 @@ module.exports = async (req, res) => {
       const order = exactOrder || data.orders[0];
       data.orders = [order];
 
-      // TRACKING & DELIVERY
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -289,7 +288,6 @@ module.exports = async (req, res) => {
         max: maxDelivery.toISOString().split('T')[0]
       };
 
-      // VARIANTS & IMAGES — FIXED WITH OPTIONAL CHAINING
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -297,7 +295,6 @@ module.exports = async (req, res) => {
         );
         const productData = await productRes.json();
         const product = productData.product;
-        // SAFE IMAGE ACCESS
         item.image_url = product?.images?.[0]?.src || 'https://via.placeholder.com/80';
         item.available_variants = product?.variants?.map(v => ({
           id: v.id,
@@ -312,19 +309,17 @@ module.exports = async (req, res) => {
         }
       }
 
-      // ROBUST DUPLICATE PROTECTION
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
 
-      if (tags.includes('exchange-processed') || 
-          tags.includes('return-processed') || 
-          tags.includes('exchange-draft') ||
-          tags.includes('portal-exchange') ||
-          tags.includes('custom-size-exchange') ||
-          note.includes('exchange requested') ||
-          note.includes('return requested')) {
+      // FINAL BULLETPROOF DUPLICATE PROTECTION
+      const exchangeTags = ['exchange-processed', 'exchange-draft', 'portal-exchange', 'exchange-portal', 'exchange-requested', 'exchange-in-progress', 'custom-size-exchange'];
+      const hasExchangeTag = exchangeTags.some(tag => tags.includes(tag));
+      const hasExchangeNote = note.includes('exchange requested') || note.includes('exchanged →') || note.includes('draft #');
+
+      if (hasExchangeTag || hasExchangeNote || tags.includes('return-processed')) {
         data.already_processed = true;
-        data.exchange_order_name = "Already Processed";
+        data.exchange_order_name = "Already Processed — Exchange/Return in Progress";
       }
 
       res.json(data);
