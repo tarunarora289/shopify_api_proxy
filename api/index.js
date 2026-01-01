@@ -10,56 +10,56 @@ module.exports = async (req, res) => {
   }
 
   const { query, contact } = req.query || {};
-  const { action, order, customer_id } = req.body || {};
+  const { action, order, customer_id, order_id, return_items } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
+
+  // ==================== POST: SUBMIT RETURN REQUEST ====================
+  if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
+    try {
+      await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
+        method: 'PUT',
+        headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          order: {
+            tags: "return-processed,portal-return",
+            note: `RETURN REQUESTED via Portal | Items: ${return_items.map(i => i.quantity + 'x line_item ' + i.line_item_id).join(', ')}`
+          }
+        })
+      });
+
+      res.json({
+        success: true,
+        message: "Return request created successfully!"
+      });
+    } catch (err) {
+      console.error('Proxy error (Return):', err.message);
+      res.status(500).json({ error: 'Return failed: ' + err.message });
+    }
+    return;
+  }
 
   // ==================== POST: CREATE EXCHANGE DRAFT ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
+      const isCustom = !order.order.line_items[0].variant_id;
 
       // 1. Check previous exchanges for fee
       const customerOrdersRes = await fetch(
         `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags`,
         { headers: { 'X-Shopify-Access-Token': token } }
       );
-      if (!customerOrdersRes.ok) throw new Error(await customerOrdersRes.text());
       const customerOrders = (await customerOrdersRes.json()).orders || [];
       const previousExchanges = customerOrders.filter(o => 
         (o.tags || '').toLowerCase().includes('exchange-processed')
       ).length;
       const addFee = previousExchanges > 0;
 
-      // ==================== POST: CREATE RETURN REQUEST ====================
-if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
-  try {
-    // Tag original order as return requested
-    await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
-      method: 'PUT',
-      headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        order: {
-          tags: "return-processed,portal-return",
-          note: `RETURN REQUESTED via Portal | Items: ${return_items.map(i => i.quantity + 'x line_item ' + i.line_item_id).join(', ')}`
-        }
-      })
-    });
-
-    res.json({
-      success: true,
-      message: "Return request created successfully!"
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-  return;
-}
-
-      // 2. Get prices from frontend payload
+      // 2. Get prices and details
       const frontendLineItem = order.order.line_items[0];
       const originalPrice = parseFloat(frontendLineItem.price || 0);
-      let newPrice = originalPrice; // default for custom
+      let newPrice = originalPrice;
       let variantTitle = 'Custom Size Item';
 
       if (frontendLineItem.variant_id) {
@@ -74,22 +74,29 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
         }
       }
 
-      // 3. Calculate total additional amount
+      // 3. Custom measurements (from frontend payload — assume sent)
+      let customNote = '';
+      if (isCustom && order.order.custom_measurements) {
+        const m = order.order.custom_measurements;
+        customNote = ` | Custom: Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`;
+      }
+
+      // 4. Calculate total additional
       let totalAdditional = newPrice - originalPrice;
       if (addFee) totalAdditional += 200;
 
-      // 4. Build line items
+      // 5. Build line items
       const draftLineItems = [
         {
           variant_id: frontendLineItem.variant_id || null,
           quantity: 1,
           price: newPrice.toFixed(2),
           title: variantTitle,
-          taxable: true
+          taxable: true,
+          requires_shipping: true  // ENSURE SHIPPING REQUIRED
         }
       ];
 
-      // Price difference line
       const priceDiff = newPrice - originalPrice;
       if (priceDiff !== 0) {
         draftLineItems.push({
@@ -100,7 +107,6 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
         });
       }
 
-      // Exchange fee
       if (addFee) {
         draftLineItems.push({
           title: "Exchange Fee",
@@ -110,7 +116,11 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
         });
       }
 
-      // 5. Create draft order
+      // 6. Tags
+      let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested";
+      if (isCustom) draftTags += ",custom-size-exchange";
+
+      // 7. Create draft
       const draftPayload = {
         draft_order: {
           line_items: draftLineItems,
@@ -118,8 +128,9 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
           email: order.order.email,
           shipping_address: order.order.shipping_address,
           billing_address: order.order.billing_address || order.order.shipping_address,
-          note: `EXCHANGE for Order ${originalOrderName} | Portal Request`,
-          tags: "exchange-draft,portal-created"
+          note: `EXCHANGE for Order ${originalOrderName} | Portal Request${customNote}`,
+          tags: draftTags,
+          requires_shipping: true  // SHIPPING REQUIRED
         }
       };
 
@@ -127,37 +138,24 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json',
-          'User-Agent': 'TrueWest-Portal/1.0'
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(draftPayload)
       });
-
-      if (!draftRes.ok) {
-        const errText = await draftRes.text();
-        throw new Error(`Draft creation failed: ${errText}`);
-      }
-
+      if (!draftRes.ok) throw new Error(await draftRes.text());
       const draftData = await draftRes.json();
       const draftId = draftData.draft_order.id;
 
-      // 6. Handle payment or auto-complete
+      // 8. Payment or auto-complete
       if (totalAdditional <= 0) {
-        // No payment needed — complete draft
         const completeRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/complete.json?payment_pending=true`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token }
         });
         if (!completeRes.ok) throw new Error(await completeRes.text());
         const completeData = await completeRes.json();
-
-        res.json({
-          success: true,
-          exchange_order: completeData.order,
-          message: "Exchange created successfully (no payment required)!"
-        });
+        res.json({ success: true, exchange_order: completeData.order });
       } else {
-        // Send invoice for payment
         const invoiceRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/send_invoice.json`, {
           method: 'POST',
           headers: {
@@ -168,24 +166,16 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
             draft_order_invoice: {
               to: order.order.email,
               subject: `Payment Required for Exchange - Order ${originalOrderName}`,
-              custom_message: `Hello!\n\nPlease pay ₹${totalAdditional.toFixed(2)} to complete your exchange.\n${
-                addFee ? "This includes a ₹200 exchange fee (first exchange is free).\n" : ""
-              }After payment, your replacement will be shipped within 2–3 days.\n\nThank you!\nTrue West Team`
+              custom_message: `Please pay ₹${totalAdditional.toFixed(2)} to complete your exchange.`
             }
           })
         });
-
         if (!invoiceRes.ok) throw new Error(await invoiceRes.text());
         const invoiceData = await invoiceRes.json();
-
-        res.json({
-          success: true,
-          payment_url: invoiceData.draft_order.invoice_url,
-          message: "Redirecting to payment..."
-        });
+        res.json({ success: true, payment_url: invoiceData.draft_order.invoice_url });
       }
 
-      // 7. Tag original order as processed (prevents duplicates)
+      // 9. Tag original
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${originalOrderName}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
@@ -197,7 +187,7 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
           body: JSON.stringify({
             order: {
               tags: "exchange-processed,portal-exchange",
-              note: `EXCHANGE REQUESTED → Draft #${draftId}`
+              note: `EXCHANGE REQUESTED → Draft #${draftId}${customNote}`
             }
           })
         });
@@ -210,7 +200,7 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
     return;
   }
 
-  // ==================== GET: FETCH ORDER ====================
+  // ==================== GET: FETCH ORDER (FULL ORIGINAL + ROBUST DUPLICATE PROTECTION) ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
@@ -241,6 +231,8 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
+
+      // TRACKING & DELIVERY
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -286,6 +278,7 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
       order.actual_delivery_date = actualDeliveryDate || null;
       order.delivered_at = actualDeliveryDate || null;
       order.current_shipping_status = currentShippingStatus;
+
       const created = new Date(order.created_at);
       const minDelivery = new Date(created);
       minDelivery.setDate(created.getDate() + 5);
@@ -295,6 +288,8 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
         min: minDelivery.toISOString().split('T')[0],
         max: maxDelivery.toISOString().split('T')[0]
       };
+
+      // VARIANTS & IMAGES
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -317,41 +312,22 @@ if (req.method === 'POST' && action === 'submit_return' && order_id && return_it
           item.current_inventory = currentVariant.inventory_quantity;
         }
       }
+
+      // ROBUST DUPLICATE PROTECTION
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-      if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
-        if (customerId) {
-          const allRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
-            headers: { 'X-Shopify-Access-Token': token }
-          });
-          const all = (await allRes.json()).orders || [];
-          const replacement = all.find(o => o.note && o.note.toLowerCase().includes(order.name.toLowerCase()));
-          if (replacement) {
-            data.already_processed = true;
-            data.exchange_order_name = replacement.name;
-            data.related_order = replacement;
-          } else {
-            data.already_processed = true;
-            data.exchange_order_name = "Processed";
-          }
-        } else {
-          data.already_processed = true;
-          data.exchange_order_name = "Processed";
-        }
-      } else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created') || tags.includes('exchange-draft')) {
+
+      if (tags.includes('exchange-processed') || 
+          tags.includes('return-processed') || 
+          tags.includes('exchange-draft') ||
+          tags.includes('portal-exchange') ||
+          tags.includes('custom-size-exchange') ||
+          note.includes('exchange requested') ||
+          note.includes('return requested')) {
         data.already_processed = true;
-        data.exchange_order_name = order.name;
-        const match = note.match(/exchange for [#]?(\d+)/i);
-        if (match) {
-          const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, {
-            headers: { 'X-Shopify-Access-Token': token }
-          });
-          const origData = await origRes.json();
-          if (origData.orders?.[0]) {
-            data.related_order = origData.orders[0];
-          }
-        }
+        data.exchange_order_name = "Already Processed";
       }
+
       res.json(data);
     } catch (err) {
       console.error('Proxy error:', err.message);
