@@ -14,17 +14,16 @@ module.exports = async (req, res) => {
   // ==================== POST: CREATE EXCHANGE ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     try {
-      // FIXED: Clean payload using currentOrder for addresses/email + frontend line_items
       const enhancedOrder = {
         line_items: order.order.line_items || [],
         customer: { id: customer_id },
-        email: currentOrder.email,
-        shipping_address: currentOrder.shipping_address,
-        billing_address: currentOrder.billing_address || currentOrder.shipping_address,
+        email: order.order.email,
+        shipping_address: order.order.shipping_address,
+        billing_address: order.order.billing_address || order.order.shipping_address,
         financial_status: "paid",
         send_receipt: true,
         send_fulfillment_receipt: false,
-        note: `EXCHANGE for Order ${currentOrder.name} | Customer Portal`,
+        note: `EXCHANGE for Order ${order.name} | Customer Portal`,
         tags: "exchange-order,portal-created"
       };
       const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
