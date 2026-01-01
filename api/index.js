@@ -74,7 +74,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      // 3. Custom measurements (from frontend payload — assume sent)
+      // 3. Custom measurements note
       let customNote = '';
       if (isCustom && order.order.custom_measurements) {
         const m = order.order.custom_measurements;
@@ -93,7 +93,7 @@ module.exports = async (req, res) => {
           price: newPrice.toFixed(2),
           title: variantTitle,
           taxable: true,
-          requires_shipping: true  // ENSURE SHIPPING REQUIRED
+          requires_shipping: true
         }
       ];
 
@@ -130,7 +130,7 @@ module.exports = async (req, res) => {
           billing_address: order.order.billing_address || order.order.shipping_address,
           note: `EXCHANGE for Order ${originalOrderName} | Portal Request${customNote}`,
           tags: draftTags,
-          requires_shipping: true  // SHIPPING REQUIRED
+          requires_shipping: true
         }
       };
 
@@ -200,7 +200,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== GET: FETCH ORDER (FULL ORIGINAL + ROBUST DUPLICATE PROTECTION) ====================
+  // ==================== GET: FETCH ORDER ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
@@ -289,7 +289,7 @@ module.exports = async (req, res) => {
         max: maxDelivery.toISOString().split('T')[0]
       };
 
-      // VARIANTS & IMAGES
+      // VARIANTS & IMAGES — FIXED WITH OPTIONAL CHAINING
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -297,16 +297,15 @@ module.exports = async (req, res) => {
         );
         const productData = await productRes.json();
         const product = productData.product;
-        if (product.images && product.images.length > 0) {
-          item.image_url = product.images[0].src;
-        }
-        item.available_variants = product.variants.map(v => ({
+        // SAFE IMAGE ACCESS
+        item.image_url = product?.images?.[0]?.src || 'https://via.placeholder.com/80';
+        item.available_variants = product?.variants?.map(v => ({
           id: v.id,
           title: v.title,
           inventory_quantity: v.inventory_quantity,
           available: v.inventory_quantity > 0
-        }));
-        const currentVariant = product.variants.find(v => v.id === item.variant_id);
+        })) || [];
+        const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
         if (currentVariant) {
           item.current_size = currentVariant.title;
           item.current_inventory = currentVariant.inventory_quantity;
