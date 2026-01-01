@@ -321,6 +321,7 @@ module.exports = async (req, res) => {
         item.available_variants = product?.variants?.map(v => ({
           id: v.id,
           title: v.title,
+          price: v.price,
           inventory_quantity: v.inventory_quantity,
           available: v.inventory_quantity > 0
         })) || [];
