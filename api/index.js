@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -7,37 +8,126 @@ module.exports = async (req, res) => {
     res.status(200).end();
     return;
   }
+
   const { query, contact } = req.query || {};
   const { action, order, customer_id } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
-  // ==================== POST: CREATE EXCHANGE ====================
+
+  // ==================== POST: CREATE EXCHANGE DRAFT WITH PAYMENT LINK ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
     try {
-      const enhancedOrder = {
-        line_items: order.order.line_items || [],
-        customer: { id: customer_id },
-        email: order.order.email,
-        shipping_address: order.order.shipping_address,
-        billing_address: order.order.billing_address || order.order.shipping_address,
-        financial_status: "paid",
-        send_receipt: true,
-        send_fulfillment_receipt: false,
-        note: `EXCHANGE for Order ${order.name} | Customer Portal`,
-        tags: "exchange-order,portal-created"
+      // 1. Check how many previous exchanges this customer had
+      const customerOrdersRes = await fetch(
+        `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags,name`,
+        { headers: { 'X-Shopify-Access-Token': token } }
+      );
+      const customerOrders = (await customerOrdersRes.json()).orders || [];
+      const previousExchanges = customerOrders.filter(o => 
+        (o.tags || '').toLowerCase().includes('exchange-processed')
+      ).length;
+      const addExchangeFee = previousExchanges > 0; // First exchange free
+
+      // 2. Get the new variant price (or use original for custom)
+      const frontendLineItem = order.order.line_items[0];
+      let newPrice = 0;
+      let variantTitle = 'Custom Size Item';
+
+      if (frontendLineItem.variant_id) {
+        const variantRes = await fetch(
+          `https://${storeDomain}/admin/api/2024-07/variants/${frontendLineItem.variant_id}.json`,
+          { headers: { 'X-Shopify-Access-Token': token } }
+        );
+        if (variantRes.ok) {
+          const variantData = await variantRes.json();
+          newPrice = parseFloat(variantData.variant.price);
+          variantTitle = variantData.variant.title || 'Selected Size';
+        }
+      } else {
+        // Custom size — use original item price
+        newPrice = parseFloat(frontendLineItem.price || 0);
+      }
+
+      // 3. Build line items for draft
+      const draftLineItems = [
+        {
+          variant_id: frontendLineItem.variant_id || null,
+          quantity: 1,
+          price: newPrice.toFixed(2),
+          title: variantTitle,
+          taxable: true
+        }
+      ];
+
+      // Add ₹200 exchange fee if not first exchange
+      if (addExchangeFee) {
+        draftLineItems.push({
+          title: "Exchange Fee",
+          price: "200.00",
+          quantity: 1,
+          taxable: false
+        });
+      }
+
+      // 4. Create draft order
+      const draftPayload = {
+        draft_order: {
+          line_items: draftLineItems,
+          customer: { id: customer_id },
+          email: order.order.email,
+          shipping_address: order.order.shipping_address,
+          billing_address: order.order.billing_address || order.order.shipping_address,
+          note: `EXCHANGE for Order ${order.name} | Portal Request${addExchangeFee ? ' | ₹200 fee applied' : ''}`,
+          tags: "exchange-draft,portal-created",
+          use_customer_default_address: true
+        }
       };
-      const response = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json`, {
+
+      const draftRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders.json`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
           'Content-Type': 'application/json',
-          'User-Agent': 'Grok-Proxy/1.0 (xai.com)'
+          'User-Agent': 'TrueWest-Portal/1.0'
         },
-        body: JSON.stringify({ order: enhancedOrder })
+        body: JSON.stringify(draftPayload)
       });
-      if (!response.ok) throw new Error(await response.text());
-      const data = await response.json();
-      // Tag original order as processed
+
+      if (!draftRes.ok) {
+        const errText = await draftRes.text();
+        throw new Error(`Draft creation failed: ${errText}`);
+      }
+
+      const draftData = await draftRes.json();
+      const draftId = draftData.draft_order.id;
+
+      // 5. Send invoice to customer (generates payment link)
+      const invoiceRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/send_invoice.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          draft_order_invoice: {
+            to: order.order.email,
+            from: "no-reply@truewest.in",
+            subject: "Complete your exchange payment",
+            custom_message: `Hello!\n\nPlease complete payment for your exchange request for Order ${order.name}.\n${
+              addExchangeFee ? "A ₹200 exchange fee has been applied (first exchange is free).\n" : ""
+            }After payment, your replacement will be shipped within 2–3 days.\n\nThank you!\nTrue West Team`
+          }
+        })
+      });
+
+      if (!invoiceRes.ok) {
+        const errText = await invoiceRes.text();
+        throw new Error(`Invoice send failed: ${errText}`);
+      }
+
+      const invoiceData = await invoiceRes.json();
+
+      // 6. Tag original order as exchange requested (payment pending)
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${order.name}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
@@ -46,28 +136,35 @@ module.exports = async (req, res) => {
         await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${origData.orders[0].id}.json`, {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order: { tags: "exchange-processed,portal-exchange",
-            note: `EXCHANGED → New Order: ${data.order.name}` } })
+          body: JSON.stringify({
+            order: {
+              tags: "exchange-processed,portal-exchange",
+              note: `EXCHANGE REQUESTED → Draft #${draftId} (payment pending)`
+            }
+          })
         });
       }
+
+      // 7. Return payment URL to frontend
       res.json({
         success: true,
-        message: "Exchange created successfully!",
-        exchange_order: data.order
+        payment_url: invoiceData.draft_order.invoice_url,
+        message: "Redirecting to payment..."
       });
+
     } catch (err) {
-      console.error('Proxy error (POST):', err.message);
-      res.status(500).json({ error: 'Proxy failed (POST): ' + err.message });
+      console.error('Proxy error (POST Draft):', err.message);
+      res.status(500).json({ error: 'Exchange failed: ' + err.message });
     }
     return;
   }
-  // ==================== GET: FETCH ORDER ====================
+
+  // ==================== GET: FETCH ORDER (UNCHANGED — FULL ORIGINAL) ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
     let customerId = null;
     try {
-      // 1. Find customer if contact provided
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
         const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
@@ -76,6 +173,7 @@ module.exports = async (req, res) => {
         const customerData = await customerResponse.json();
         if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
         customerId = customerData.customers[0].id;
+
         const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
         const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
@@ -86,15 +184,17 @@ module.exports = async (req, res) => {
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
       }
+
       if (!data.orders || data.orders.length === 0) {
         return res.status(404).json({ error: 'Order not found' });
       }
-      // ENSURE ONLY ONE ORDER IS RETURNED
+
       const cleanQuery = query.replace('#', '');
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
-      // ==================== TRACKING & DELIVERY DATE ====================
+
+      // TRACKING & DELIVERY DATE
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -137,9 +237,11 @@ module.exports = async (req, res) => {
           currentShippingStatus = 'Unknown';
         }
       }
+
       order.actual_delivery_date = actualDeliveryDate || null;
       order.delivered_at = actualDeliveryDate || null;
       order.current_shipping_status = currentShippingStatus;
+
       const created = new Date(order.created_at);
       const minDelivery = new Date(created);
       minDelivery.setDate(created.getDate() + 5);
@@ -149,7 +251,8 @@ module.exports = async (req, res) => {
         min: minDelivery.toISOString().split('T')[0],
         max: maxDelivery.toISOString().split('T')[0]
       };
-      // ==================== PRODUCT IMAGES & VARIANTS ====================
+
+      // PRODUCT IMAGES & VARIANTS
       for (let item of order.line_items) {
         const productRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
@@ -172,10 +275,11 @@ module.exports = async (req, res) => {
           item.current_inventory = currentVariant.inventory_quantity;
         }
       }
-      // ==================== FINAL DUPLICATE PROTECTION + REFERENCE (PERFECT) ====================
+
+      // DUPLICATE PROTECTION + RELATED ORDER
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-      // Case 1: Original order → show replacement
+
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
         if (customerId) {
           const allRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
@@ -195,9 +299,7 @@ module.exports = async (req, res) => {
           data.already_processed = true;
           data.exchange_order_name = "Processed";
         }
-      }
-      // Case 2: Replacement order → show original
-      else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
+      } else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created') || tags.includes('exchange-draft')) {
         data.already_processed = true;
         data.exchange_order_name = order.name;
         const match = note.match(/exchange for [#]?(\d+)/i);
@@ -211,6 +313,7 @@ module.exports = async (req, res) => {
           }
         }
       }
+
       res.json(data);
     } catch (err) {
       console.error('Proxy error:', err.message);
@@ -218,5 +321,6 @@ module.exports = async (req, res) => {
     }
     return;
   }
+
   res.status(400).json({ error: 'Invalid request' });
 };
