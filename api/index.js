@@ -31,6 +31,31 @@ module.exports = async (req, res) => {
       ).length;
       const addFee = previousExchanges > 0;
 
+      // ==================== POST: CREATE RETURN REQUEST ====================
+if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
+  try {
+    // Tag original order as return requested
+    await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
+      method: 'PUT',
+      headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        order: {
+          tags: "return-processed,portal-return",
+          note: `RETURN REQUESTED via Portal | Items: ${return_items.map(i => i.quantity + 'x line_item ' + i.line_item_id).join(', ')}`
+        }
+      })
+    });
+
+    res.json({
+      success: true,
+      message: "Return request created successfully!"
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+  return;
+}
+
       // 2. Get prices from frontend payload
       const frontendLineItem = order.order.line_items[0];
       const originalPrice = parseFloat(frontendLineItem.price || 0);
