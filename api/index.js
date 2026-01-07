@@ -74,6 +74,7 @@ module.exports = async (req, res) => {
       let totalCustomFees = 0;
       let totalExchangeFees = 0;
       const draftLineItems = [];
+      let hasCustomSize = false;
 
       for (const selected of selected_line_items) {
         const originalPrice = parseFloat(selected.price || 0);
@@ -82,6 +83,8 @@ module.exports = async (req, res) => {
         let productId = selected.product_id;
         let productTitle = selected.title || 'Custom Item';
         const isCustom = !selected.variant_id;
+
+        if (isCustom) hasCustomSize = true;
 
         // Fetch new variant price if not custom
         if (selected.variant_id) {
@@ -103,7 +106,7 @@ module.exports = async (req, res) => {
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           if (productRes.ok) {
-            const prodData = await productRes.json();
+            const prodData = await prodRes.json();
             const product = prodData.product;
             productTitle = product.title;
           }
@@ -145,13 +148,13 @@ module.exports = async (req, res) => {
         const priceDiff = newPrice - originalPrice;
         totalPriceDifference += priceDiff;
 
-        // Q1: Add ₹200 custom size fee (only from 2nd exchange onwards)
+        // Q1: Add ₹200 custom size fee per item (only from 2nd exchange onwards)
         if (isCustom && !isFirstExchange) {
           totalCustomFees += 200;
         }
       }
 
-      // Q1: Add ₹200 exchange fee (only from 2nd exchange onwards)
+      // Q1: Add ₹200 exchange fee once per order (only from 2nd exchange onwards)
       if (!isFirstExchange) {
         totalExchangeFees += 200;
       }
@@ -159,7 +162,7 @@ module.exports = async (req, res) => {
       // Add fee line items to draft
       if (totalCustomFees > 0) {
         draftLineItems.push({
-          title: "Custom Size Fee",
+          title: `Custom Size Fee (${totalCustomFees / 200} item${totalCustomFees > 200 ? 's' : ''})`,
           price: totalCustomFees.toFixed(2),
           quantity: 1,
           taxable: false,
@@ -169,7 +172,7 @@ module.exports = async (req, res) => {
 
       if (totalExchangeFees > 0) {
         draftLineItems.push({
-          title: "Exchange Fee",
+          title: "Exchange Processing Fee",
           price: totalExchangeFees.toFixed(2),
           quantity: 1,
           taxable: false,
@@ -193,7 +196,7 @@ module.exports = async (req, res) => {
 
       // Build draft order tags
       let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested";
-      if (selected_line_items.some(i => !i.variant_id)) {
+      if (hasCustomSize) {
         draftTags += ",custom-size-exchange";
       }
 
@@ -235,7 +238,7 @@ module.exports = async (req, res) => {
       const draftId = draftData.draft_order.id;
       const draftOrderName = draftData.draft_order.name;
 
-      // Q3: Tag and update original order with exchange details
+      // Q3: Tag original order FIRST with draft reference
       if (original_order_id) {
         try {
           await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
@@ -243,8 +246,8 @@ module.exports = async (req, res) => {
             headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               order: {
-                tags: "exchange-processed,portal-exchange",
-                note: `EXCHANGED → New Order: ${draftOrderName} (Draft ID: ${draftId})`
+                tags: "exchange-in-progress,portal-exchange",
+                note: `EXCHANGE REQUESTED → Draft Order: ${draftOrderName}`
               }
             })
           });
@@ -271,8 +274,9 @@ module.exports = async (req, res) => {
 
         const completeData = await completeRes.json();
         const completedOrder = completeData.draft_order;
+        const completedOrderName = completedOrder.name || `#${completedOrder.order_id}`;
 
-        // Update original order with completed exchange order number
+        // FIX: Update original order with COMPLETED exchange order number
         if (original_order_id) {
           try {
             await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
@@ -280,7 +284,8 @@ module.exports = async (req, res) => {
               headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 order: {
-                  note: `EXCHANGED → New Order: ${completedOrder.name}`
+                  tags: "exchange-processed,portal-exchange",
+                  note: `EXCHANGED → New Order: ${completedOrderName}`
                 }
               })
             });
@@ -314,6 +319,7 @@ module.exports = async (req, res) => {
                   subject: `Payment Required for Exchange - Order ${originalOrderName}`,
                   custom_message: `Hi! To complete your exchange, please pay ₹${totalAmountDue.toFixed(2)}. This includes:\n\n` +
                     (totalPriceDifference > 0 ? `• Price Difference: ₹${totalPriceDifference.toFixed(2)}\n` : '') +
+                    (totalPriceDifference < 0 ? `• Store Credit Applied: ₹${Math.abs(totalPriceDifference).toFixed(2)}\n` : '') +
                     (totalCustomFees > 0 ? `• Custom Size Fee: ₹${totalCustomFees.toFixed(2)}\n` : '') +
                     (totalExchangeFees > 0 ? `• Exchange Fee: ₹${totalExchangeFees.toFixed(2)}\n` : '') +
                     `\nClick the button below to complete payment.`
@@ -325,11 +331,9 @@ module.exports = async (req, res) => {
           if (!invoiceRes.ok) {
             const errorText = await invoiceRes.text();
             console.warn('Invoice sending failed:', errorText);
-            // Don't throw - continue with payment_url response
           }
         } catch (invoiceErr) {
           console.warn('Warning: Could not send invoice email:', invoiceErr.message);
-          // Continue execution - frontend will show payment URL
         }
 
         res.json({ 
@@ -365,7 +369,6 @@ module.exports = async (req, res) => {
     let customerId = null;
 
     try {
-      // Fetch customer and order
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
         const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
@@ -394,7 +397,6 @@ module.exports = async (req, res) => {
       const order = exactOrder || data.orders[0];
       data.orders = [order];
 
-      // Extract customer ID from order if not already set
       if (!customerId && order.customer) {
         customerId = order.customer.id;
       }
@@ -421,7 +423,6 @@ module.exports = async (req, res) => {
         data.exchange_count = 0;
       }
 
-      // Fetch delivery tracking info
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
@@ -511,7 +512,6 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Check if order already processed
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
       
