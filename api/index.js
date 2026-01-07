@@ -10,7 +10,7 @@ module.exports = async (req, res) => {
   }
 
   const { query, contact } = req.query || {};
-  const { action, order, customer_id, order_id, return_items } = req.body || {};
+  const { action, order, customer_id, order_id, return_items, selected_line_items } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
@@ -40,12 +40,11 @@ module.exports = async (req, res) => {
   }
 
   // ==================== POST: CREATE EXCHANGE DRAFT ====================
-  if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id) {
+  if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id && selected_line_items) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
-      const isCustom = !order.order.line_items[0].variant_id;
 
-      // 1. Check previous exchanges for fee
+      // 1. Check previous exchanges for fee (first is free)
       const customerOrdersRes = await fetch(
         `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags`,
         { headers: { 'X-Shopify-Access-Token': token } }
@@ -54,61 +53,73 @@ module.exports = async (req, res) => {
       const previousExchanges = customerOrders.filter(o => 
         (o.tags || '').toLowerCase().includes('exchange-processed')
       ).length;
-      const addFee = previousExchanges > 0;
+      const isFirstExchange = previousExchanges === 0;
 
-      // 2. Get original line item details
-      const frontendLineItem = order.order.line_items[0];
-      const originalPrice = parseFloat(frontendLineItem.price || 0);
-      let newPrice = originalPrice;
-      let variantTitle = 'Custom Size Item';
-      let productId = frontendLineItem.product_id;
-      let productTitle = frontendLineItem.title || 'Custom Item';
-      let productImage = 'https://via.placeholder.com/80';
+      // 2. Process selected line items
+      let totalAdditional = 0;
+      const draftLineItems = [];
 
-      if (frontendLineItem.variant_id) {
-        const variantRes = await fetch(
-          `https://${storeDomain}/admin/api/2024-07/variants/${frontendLineItem.variant_id}.json`,
-          { headers: { 'X-Shopify-Access-Token': token } }
-        );
-        if (variantRes.ok) {
-          const variantData = await variantRes.json();
-          newPrice = parseFloat(variantData.variant.price || originalPrice);
-          variantTitle = variantData.variant.title || 'Selected Size';
+      for (const selected of selected_line_items) {
+        const frontendLineItem = selected;
+        const originalPrice = parseFloat(frontendLineItem.price || 0);
+        let newPrice = originalPrice;
+        let variantTitle = 'Custom Size Item';
+        let productId = frontendLineItem.product_id;
+        let productTitle = frontendLineItem.title || 'Custom Item';
+        let productImage = 'https://via.placeholder.com/80';
+        const isCustom = !frontendLineItem.variant_id;
+
+        if (frontendLineItem.variant_id) {
+          const variantRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/variants/${frontendLineItem.variant_id}.json`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          if (variantRes.ok) {
+            const variantData = await variantRes.json();
+            newPrice = parseFloat(variantData.variant.price || originalPrice);
+            variantTitle = variantData.variant.title || 'Selected Size';
+          }
         }
-      }
 
-      // 3. For custom — fetch original product title & image
-      if (isCustom && productId) {
-        const productRes = await fetch(
-          `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
-          { headers: { 'X-Shopify-Access-Token': token } }
-        );
-        if (productRes.ok) {
-          const prodData = await productRes.json();
-          const product = prodData.product;
-          productTitle = product.title;
-          productImage = product.images?.[0]?.src || productImage;
+        // Custom: fetch product title & image
+        if (isCustom && productId) {
+          const productRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          if (productRes.ok) {
+            const prodData = await productRes.json();
+            const product = prodData.product;
+            productTitle = product.title;
+            productImage = product.images?.[0]?.src || productImage;
+          }
         }
-      }
 
-      // 4. Custom measurements note
-      let customNote = '';
-      let customProperties = {};
-      if (isCustom && order.order.custom_measurements) {
-        const m = order.order.custom_measurements;
-        customNote = ` | Custom: Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`;
-        customProperties = {
-          "Custom Measurements": `Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`
-        };
-      }
+        // Custom measurements
+        let customNote = '';
+        let customProperties = {};
+        if (isCustom && frontendLineItem.custom_measurements) {
+          const m = frontendLineItem.custom_measurements;
+          customNote = ` | Custom: Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`;
+          customProperties = {
+            "Custom Measurements": `Bust ${m.bust || '-'}", Waist ${m.waist || '-'}", Hips ${m.hips || '-'}", Shoulder ${m.shoulder || '-'}", Length ${m.length || '-'}in`
+          };
+        }
 
-      // 5. Calculate total additional
-      let totalAdditional = newPrice - originalPrice;
-      if (addFee) totalAdditional += 200;
+        // Add ₹200 for custom size only if NOT first exchange
+        if (isCustom && !isFirstExchange) {
+          totalAdditional += 200;
+          draftLineItems.push({
+            title: "Custom Size Fee",
+            price: "200.00",
+            quantity: 1,
+            taxable: false
+          });
+        }
 
-      // 6. Build line items — USE ORIGINAL PRODUCT IMAGE/TITLE FOR CUSTOM
-      const draftLineItems = [
-        {
+        totalAdditional += (newPrice - originalPrice);
+
+        draftLineItems.push({
           product_id: productId,
           variant_id: frontendLineItem.variant_id || null,
           quantity: 1,
@@ -118,20 +129,22 @@ module.exports = async (req, res) => {
           properties: isCustom ? customProperties : {},
           taxable: true,
           requires_shipping: true
-        }
-      ];
-
-      const priceDiff = newPrice - originalPrice;
-      if (priceDiff !== 0) {
-        draftLineItems.push({
-          title: priceDiff > 0 ? "Price Difference" : "Price Adjustment Refund",
-          price: priceDiff.toFixed(2),
-          quantity: 1,
-          taxable: false
         });
+
+        const priceDiff = newPrice - originalPrice;
+        if (priceDiff !== 0) {
+          draftLineItems.push({
+            title: priceDiff > 0 ? "Price Difference" : "Price Adjustment Store Credit",
+            price: priceDiff.toFixed(2),
+            quantity: 1,
+            taxable: false
+          });
+        }
       }
 
-      if (addFee) {
+      // Regular exchange fee if second+ exchange
+      if (!isFirstExchange) {
+        totalAdditional += 200;
         draftLineItems.push({
           title: "Exchange Fee",
           price: "200.00",
@@ -140,11 +153,11 @@ module.exports = async (req, res) => {
         });
       }
 
-      // 7. Tags
+      // Tags
       let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested,exchange-in-progress";
-      if (isCustom) draftTags += ",custom-size-exchange";
+      if (selected_line_items.some(i => !i.variant_id)) draftTags += ",custom-size-exchange";
 
-      // 8. Create draft
+      // Create draft
       const draftPayload = {
         draft_order: {
           line_items: draftLineItems,
@@ -152,7 +165,7 @@ module.exports = async (req, res) => {
           email: order.order.email,
           shipping_address: order.order.shipping_address,
           billing_address: order.order.billing_address || order.order.shipping_address,
-          note: `EXCHANGE for Order ${originalOrderName} | Portal Request${customNote}`,
+          note: `EXCHANGE for Order ${originalOrderName} | Portal Request${customNote || ''}`,
           tags: draftTags,
           requires_shipping: true
         }
@@ -170,7 +183,7 @@ module.exports = async (req, res) => {
       const draftData = await draftRes.json();
       const draftId = draftData.draft_order.id;
 
-      // 9. Payment or auto-complete
+      // Payment or auto-complete
       if (totalAdditional <= 0) {
         const completeRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/complete.json?payment_pending=true`, {
           method: 'PUT',
@@ -199,7 +212,7 @@ module.exports = async (req, res) => {
         res.json({ success: true, payment_url: invoiceData.draft_order.invoice_url });
       }
 
-      // 10. Tag original
+      // Tag original
       const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${originalOrderName}`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
@@ -211,7 +224,7 @@ module.exports = async (req, res) => {
           body: JSON.stringify({
             order: {
               tags: "exchange-processed,portal-exchange,exchange-in-progress",
-              note: `EXCHANGE REQUESTED → Draft #${draftId}${customNote}`
+              note: `EXCHANGE REQUESTED → Draft #${draftId}`
             }
           })
         });
@@ -311,29 +324,33 @@ module.exports = async (req, res) => {
         max: maxDelivery.toISOString().split('T')[0]
       };
       for (let item of order.line_items) {
-        const productRes = await fetch(
-          `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
-          { headers: { 'X-Shopify-Access-Token': token } }
-        );
-        const productData = await productRes.json();
-        const product = productData.product;
-        item.image_url = product?.images?.[0]?.src || 'https://via.placeholder.com/80';
-        item.available_variants = product?.variants?.map(v => ({
-          id: v.id,
-          title: v.title,
-          price: v.price,
-          inventory_quantity: v.inventory_quantity,
-          available: v.inventory_quantity > 0
-        })) || [];
-        const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
-        if (currentVariant) {
-          item.current_size = currentVariant.title;
-          item.current_inventory = currentVariant.inventory_quantity;
+        if (item.product_id) {
+          const productRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          const productData = await productRes.json();
+          const product = productData.product;
+          item.image_url = product?.images?.[0]?.src || 'https://via.placeholder.com/80';
+          item.available_variants = product?.variants?.map(v => ({
+            id: v.id,
+            title: v.title,
+            price: v.price,  // ← PRICE ADDED
+            inventory_quantity: v.inventory_quantity,
+            available: v.inventory_quantity > 0
+          })) || [];
+          const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
+          if (currentVariant) {
+            item.current_size = currentVariant.title;
+            item.current_inventory = currentVariant.inventory_quantity;
+          }
+        } else {
+          item.image_url = 'https://via.placeholder.com/80';
+          item.available_variants = [];
         }
       }
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-      // Case 1: Original order → show replacement
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
         if (customerId) {
           const allRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, {
@@ -353,9 +370,7 @@ module.exports = async (req, res) => {
           data.already_processed = true;
           data.exchange_order_name = "Processed";
         }
-      }
-      // Case 2: Replacement order → show original
-      else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
+      } else if (note.includes('exchange for') || tags.includes('exchange-order') || tags.includes('portal-created')) {
         data.already_processed = true;
         data.exchange_order_name = order.name;
         const match = note.match(/exchange for [#]?(\d+)/i);
