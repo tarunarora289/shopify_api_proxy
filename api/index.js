@@ -58,7 +58,7 @@ module.exports = async (req, res) => {
     try {
       const originalOrderName = order.name || 'Unknown Order';
 
-      // Q1 & Q4: Count previous exchanges to determine fees
+      // Count previous exchanges
       const customerOrdersRes = await fetch(
         `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags`,
         { headers: { 'X-Shopify-Access-Token': token } }
@@ -69,7 +69,6 @@ module.exports = async (req, res) => {
       ).length;
       const isFirstExchange = previousExchanges === 0;
 
-      // Q1 & Q5: Process each selected line item individually
       let totalPriceDifference = 0;
       let totalCustomFees = 0;
       let totalExchangeFees = 0;
@@ -86,7 +85,6 @@ module.exports = async (req, res) => {
 
         if (isCustom) hasCustomSize = true;
 
-        // Fetch new variant price if not custom
         if (selected.variant_id) {
           const variantRes = await fetch(
             `https://${storeDomain}/admin/api/2024-07/variants/${selected.variant_id}.json`,
@@ -99,20 +97,18 @@ module.exports = async (req, res) => {
           }
         }
 
-        // Fetch product details for custom sizes
         if (isCustom && productId) {
           const productRes = await fetch(
             `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           if (productRes.ok) {
-            const prodData = await prodRes.json();
+            const prodData = await productRes.json();
             const product = prodData.product;
             productTitle = product.title;
           }
         }
 
-        // Q3: Build custom measurements as line item properties
         let customProperties = [];
         if (isCustom && selected.custom_measurements) {
           const m = selected.custom_measurements;
@@ -132,7 +128,6 @@ module.exports = async (req, res) => {
           ];
         }
 
-        // Add main product line item
         draftLineItems.push({
           product_id: productId,
           variant_id: selected.variant_id || null,
@@ -144,22 +139,20 @@ module.exports = async (req, res) => {
           requires_shipping: true
         });
 
-        // Q1: Calculate price difference for this item
         const priceDiff = newPrice - originalPrice;
         totalPriceDifference += priceDiff;
 
-        // Q1: Add ₹200 custom size fee per item (only from 2nd exchange onwards)
-        if (isCustom && !isFirstExchange) {
+        // FIX: Custom size ₹200 ALWAYS applies (even on first exchange)
+        if (isCustom) {
           totalCustomFees += 200;
         }
       }
 
-      // Q1: Add ₹200 exchange fee once per order (only from 2nd exchange onwards)
+      // Exchange fee FREE on first, ₹200 from 2nd onwards
       if (!isFirstExchange) {
         totalExchangeFees += 200;
       }
 
-      // Add fee line items to draft
       if (totalCustomFees > 0) {
         draftLineItems.push({
           title: `Custom Size Fee (${totalCustomFees / 200} item${totalCustomFees > 200 ? 's' : ''})`,
@@ -180,7 +173,6 @@ module.exports = async (req, res) => {
         });
       }
 
-      // Add price difference line item (can be positive or negative)
       if (totalPriceDifference !== 0) {
         draftLineItems.push({
           title: totalPriceDifference > 0 ? "Price Difference" : "Price Adjustment (Store Credit)",
@@ -191,22 +183,18 @@ module.exports = async (req, res) => {
         });
       }
 
-      // Calculate total amount customer needs to pay
       const totalAmountDue = totalPriceDifference + totalCustomFees + totalExchangeFees;
 
-      // Build draft order tags
       let draftTags = "exchange-draft,portal-created,exchange-portal,exchange-requested";
       if (hasCustomSize) {
         draftTags += ",custom-size-exchange";
       }
 
-      // Q3: Build comprehensive note with all exchange details
       const itemSummary = selected_line_items.map((item, idx) => {
         const type = item.variant_id ? 'Size Change' : 'Custom Size';
         return `Item ${idx + 1}: ${item.title} (${type})`;
       }).join(' | ');
 
-      // Create draft order
       const draftPayload = {
         draft_order: {
           line_items: draftLineItems,
@@ -238,7 +226,6 @@ module.exports = async (req, res) => {
       const draftId = draftData.draft_order.id;
       const draftOrderName = draftData.draft_order.name;
 
-      // Q3: Tag original order FIRST with draft reference
       if (original_order_id) {
         try {
           await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
@@ -256,9 +243,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Q4: Decide whether to complete order or require payment
       if (totalAmountDue <= 0) {
-        // No payment needed - complete the draft order automatically
         const completeRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/complete.json`,
           {
@@ -276,7 +261,6 @@ module.exports = async (req, res) => {
         const completedOrder = completeData.draft_order;
         const completedOrderName = completedOrder.name || `#${completedOrder.order_id}`;
 
-        // FIX: Update original order with COMPLETED exchange order number
         if (original_order_id) {
           try {
             await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
@@ -302,7 +286,6 @@ module.exports = async (req, res) => {
         });
 
       } else {
-        // Q2: Payment needed - send invoice email to customer
         try {
           const invoiceRes = await fetch(
             `https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/send_invoice.json`,
@@ -401,7 +384,6 @@ module.exports = async (req, res) => {
         customerId = order.customer.id;
       }
 
-      // Q1: Count exchange history for fee calculation
       if (customerId) {
         try {
           const customerOrdersRes = await fetch(
@@ -482,7 +464,6 @@ module.exports = async (req, res) => {
         max: maxDelivery.toISOString().split('T')[0]
       };
 
-      // Q5: Enrich line items with product variants for per-item selection
       for (let item of order.line_items) {
         if (item.product_id) {
           const productRes = await fetch(
