@@ -10,20 +10,32 @@ module.exports = async (req, res) => {
   }
 
   const { query, contact } = req.query || {};
-  const { action, order, customer_id, order_id, return_items, selected_line_items } = req.body || {};
+  const { action, order, customer_id, order_id, return_items, selected_line_items, original_order_id, note, tags } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
   // ==================== POST: SUBMIT RETURN REQUEST ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
+      // B2 & B4: Use frontend-provided note if available, otherwise generate
+      let orderNote = note; // B4: Use frontend note if provided
+      let orderTags = tags || "return-processed,portal-return"; // B4: Use frontend tags if provided
+      
+      // B2: If no note from frontend, generate from return_items
+      if (!orderNote) {
+        const returnReason = return_items[0]?.reason || 'Not specified';
+        const returnComment = return_items[0]?.comment || '';
+        const itemsList = return_items.map(i => i.quantity + 'x line_item ' + i.line_item_id).join(', ');
+        orderNote = `RETURN REQUESTED via Portal | Items: ${itemsList} | Reason: ${returnReason}${returnComment ? ' | Comment: ' + returnComment : ''}`;
+      }
+
       await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
         method: 'PUT',
         headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           order: {
-            tags: "return-processed,portal-return",
-            note: `RETURN REQUESTED via Portal | Items: ${return_items.map(i => i.quantity + 'x line_item ' + i.line_item_id).join(', ')}`
+            tags: orderTags,
+            note: orderNote
           }
         })
       });
@@ -34,7 +46,12 @@ module.exports = async (req, res) => {
       });
     } catch (err) {
       console.error('Proxy error (Return):', err.message);
-      res.status(500).json({ error: 'Return failed: ' + err.message });
+      // B5: Better error response
+      res.status(500).json({ 
+        error: 'Return failed: ' + err.message,
+        code: 'RETURN_ERROR',
+        details: err.toString()
+      });
     }
     return;
   }
@@ -162,10 +179,10 @@ module.exports = async (req, res) => {
         draft_order: {
           line_items: draftLineItems,
           customer: { id: customer_id },
-          email: order.order.email,
-          shipping_address: order.order.shipping_address,
-          billing_address: order.order.billing_address || order.order.shipping_address,
-          note: `EXCHANGE for Order ${originalOrderName} | Portal Request${customNote || ''}`,
+          email: order.email,
+          shipping_address: order.shipping_address,
+          billing_address: order.billing_address || order.shipping_address,
+          note: `EXCHANGE for Order ${originalOrderName} | Portal Request${selected_line_items.some(i => i.custom_measurements) ? ' | Custom Size' : ''}`,
           tags: draftTags,
           requires_shipping: true
         }
@@ -179,9 +196,31 @@ module.exports = async (req, res) => {
         },
         body: JSON.stringify(draftPayload)
       });
-      if (!draftRes.ok) throw new Error(await draftRes.text());
+      if (!draftRes.ok) {
+        const errorText = await draftRes.text();
+        throw new Error('Draft creation failed: ' + errorText);
+      }
       const draftData = await draftRes.json();
       const draftId = draftData.draft_order.id;
+
+      // B3: Tag original order using original_order_id from payload (more reliable)
+      if (original_order_id) {
+        try {
+          await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
+            method: 'PUT',
+            headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              order: {
+                tags: "exchange-processed,portal-exchange,exchange-in-progress",
+                note: `EXCHANGE REQUESTED → Draft #${draftId}`
+              }
+            })
+          });
+        } catch (tagErr) {
+          console.warn('Warning: Could not tag original order:', tagErr.message);
+          // Don't fail the whole request if tagging fails
+        }
+      }
 
       // Payment or auto-complete
       if (totalAdditional <= 0) {
@@ -189,9 +228,16 @@ module.exports = async (req, res) => {
           method: 'PUT',
           headers: { 'X-Shopify-Access-Token': token }
         });
-        if (!completeRes.ok) throw new Error(await completeRes.text());
+        if (!completeRes.ok) {
+          const errorText = await completeRes.text();
+          throw new Error('Draft completion failed: ' + errorText);
+        }
         const completeData = await completeRes.json();
-        res.json({ success: true, exchange_order: completeData.order });
+        res.json({ 
+          success: true, 
+          exchange_order: completeData.order,
+          message: "Exchange order created successfully!"
+        });
       } else {
         const invoiceRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/send_invoice.json`, {
           method: 'POST',
@@ -201,38 +247,34 @@ module.exports = async (req, res) => {
           },
           body: JSON.stringify({
             draft_order_invoice: {
-              to: order.order.email,
+              to: order.email,
               subject: `Payment Required for Exchange - Order ${originalOrderName}`,
               custom_message: `Please pay ₹${totalAdditional.toFixed(2)} to complete your exchange.`
             }
           })
         });
-        if (!invoiceRes.ok) throw new Error(await invoiceRes.text());
+        if (!invoiceRes.ok) {
+          const errorText = await invoiceRes.text();
+          throw new Error('Invoice sending failed: ' + errorText);
+        }
         const invoiceData = await invoiceRes.json();
-        res.json({ success: true, payment_url: invoiceData.draft_order.invoice_url });
-      }
-
-      // Tag original
-      const origRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders.json?name=${originalOrderName}`, {
-        headers: { 'X-Shopify-Access-Token': token }
-      });
-      const origData = await origRes.json();
-      if (origData.orders?.[0]) {
-        await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${origData.orders[0].id}.json`, {
-          method: 'PUT',
-          headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            order: {
-              tags: "exchange-processed,portal-exchange,exchange-in-progress",
-              note: `EXCHANGE REQUESTED → Draft #${draftId}`
-            }
-          })
+        res.json({ 
+          success: true, 
+          payment_url: invoiceData.draft_order.invoice_url,
+          draft_id: draftId,
+          amount_due: totalAdditional.toFixed(2),
+          message: "Payment required to complete exchange"
         });
       }
 
     } catch (err) {
       console.error('Proxy error (POST):', err.message);
-      res.status(500).json({ error: 'Exchange failed: ' + err.message });
+      // B5: Better error response
+      res.status(500).json({ 
+        error: 'Exchange failed: ' + err.message,
+        code: 'EXCHANGE_ERROR',
+        details: err.toString()
+      });
     }
     return;
   }
@@ -268,6 +310,28 @@ module.exports = async (req, res) => {
       const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
+
+      // B1: Count exchange history for customer (CRITICAL FIX)
+      if (customerId) {
+        try {
+          const customerOrdersRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&status=any&limit=250&fields=tags`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          if (customerOrdersRes.ok) {
+            const customerOrders = (await customerOrdersRes.json()).orders || [];
+            const exchangeCount = customerOrders.filter(o => 
+              (o.tags || '').toLowerCase().includes('exchange-processed')
+            ).length;
+            data.exchange_count = exchangeCount; // B1: Added for frontend
+          }
+        } catch (exchangeCountErr) {
+          console.warn('Warning: Could not fetch exchange count:', exchangeCountErr.message);
+          data.exchange_count = 0; // Fallback to 0 if fetch fails
+        }
+      } else {
+        data.exchange_count = 0; // No customer ID means no history
+      }
 
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
@@ -335,7 +399,7 @@ module.exports = async (req, res) => {
           item.available_variants = product?.variants?.map(v => ({
             id: v.id,
             title: v.title,
-            price: v.price,  // ← PRICE ADDED
+            price: v.price,
             inventory_quantity: v.inventory_quantity,
             available: v.inventory_quantity > 0
           })) || [];
@@ -387,7 +451,12 @@ module.exports = async (req, res) => {
       res.json(data);
     } catch (err) {
       console.error('Proxy error:', err.message);
-      res.status(500).json({ error: err.message });
+      // B5: Better error response
+      res.status(500).json({ 
+        error: err.message,
+        code: 'ORDER_FETCH_ERROR',
+        details: err.toString()
+      });
     }
     return;
   }
