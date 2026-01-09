@@ -14,73 +14,128 @@ module.exports = async (req, res) => {
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // ==================== POST: SUBMIT RETURN REQUEST (UPGRADED WITH SHOPIFY API) ====================
+  // ==================== POST: SUBMIT RETURN REQUEST (✅ FIXED FOR COD) ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
-      // Step 1: Get order details to find fulfillment line item IDs
-      const orderRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
+      // Step 1: Get order details
+      const orderRes = await fetch(\`https://\${storeDomain}/admin/api/2024-07/orders/\${order_id}.json\`, {
         headers: { 'X-Shopify-Access-Token': token }
       });
-      
+
       if (!orderRes.ok) {
         throw new Error('Unable to fetch order details');
       }
-      
+
       const orderData = await orderRes.json();
       const order = orderData.order;
-      
-      // Step 2: Map return items to fulfillment line items
+
+      // ✅ NEW: Step 2: Fetch Fulfillment Orders separately (better for COD)
+      const foRes = await fetch(
+        \`https://\${storeDomain}/admin/api/2024-07/fulfillment_orders.json?order_id=\${order_id}\`,
+        { headers: { 'X-Shopify-Access-Token': token } }
+      );
+
+      if (!foRes.ok) {
+        throw new Error('Unable to fetch fulfillment orders');
+      }
+
+      const foData = await foRes.json();
+      const fulfillmentOrders = foData.fulfillment_orders || [];
+
+      // ✅ NEW: Debug logging
+      console.log('=== RETURN REQUEST DEBUG ===');
+      console.log('Order:', order.name);
+      console.log('Financial Status:', order.financial_status);
+      console.log('Fulfillment Status:', order.fulfillment_status);
+      console.log('Fulfillment Orders:', fulfillmentOrders.length);
+      console.log('FO Details:', JSON.stringify(fulfillmentOrders.map(fo => ({
+        id: fo.id,
+        status: fo.status,
+        line_items_count: fo.line_items?.length
+      })), null, 2));
+
+      // ✅ NEW: Find fulfilled fulfillment order
+      const fulfilledFO = fulfillmentOrders.find(fo => 
+        fo.status === 'fulfilled' || fo.status === 'in_progress'
+      );
+
+      if (!fulfilledFO) {
+        return res.status(400).json({
+          error: 'Order not fulfilled',
+          message: 'Your order has not been delivered yet. Returns can only be created after delivery.',
+          code: 'ORDER_NOT_FULFILLED',
+          order_name: order.name
+        });
+      }
+
+      // ✅ NEW: Create line item mapping
+      const lineItemMapping = {};
+      fulfilledFO.line_items.forEach(foli => {
+        lineItemMapping[foli.line_item_id] = foli.id;
+      });
+
+      console.log('Line Item Mapping:', lineItemMapping);
+
+      // Step 3: Map return items to fulfillment line items
       const returnLineItems = [];
-      
+      const failedItems = [];
+
       for (const returnItem of return_items) {
         const lineItem = order.line_items.find(li => li.id === returnItem.line_item_id);
-        
+
         if (!lineItem) {
-          console.warn(`Line item ${returnItem.line_item_id} not found in order`);
+          console.warn(\`Line item \${returnItem.line_item_id} not found in order\`);
+          failedItems.push({ 
+            item_id: returnItem.line_item_id, 
+            reason: 'Line item not found in order' 
+          });
           continue;
         }
-        
-        let fulfillmentLineItemId = null;
-        
-        if (order.fulfillments && order.fulfillments.length > 0) {
-          for (const fulfillment of order.fulfillments) {
-            const fli = fulfillment.line_items.find(fli => fli.id === returnItem.line_item_id);
-            if (fli && fli.fulfillment_line_item_id) {
-              fulfillmentLineItemId = fli.fulfillment_line_item_id;
-              break;
-            }
-          }
-        }
-        
-        if (!fulfillmentLineItemId) {
-          console.warn(`Fulfillment line item not found for line item ${returnItem.line_item_id}`);
+
+        // ✅ CHANGED: Use the mapped fulfillment order line item ID
+        const fulfillmentOrderLineItemId = lineItemMapping[returnItem.line_item_id];
+
+        if (!fulfillmentOrderLineItemId) {
+          console.warn(\`Fulfillment line item not found for line item \${returnItem.line_item_id}\`);
+          failedItems.push({
+            item_id: returnItem.line_item_id,
+            title: lineItem.title,
+            reason: 'Fulfillment line item not found'
+          });
           continue;
         }
-        
+
         const reasonMap = {
           'size': 'SIZE_TOO_SMALL',
           'defective': 'DEFECTIVE',
           'quality': 'NOT_AS_DESCRIBED',
           'other': 'OTHER'
         };
-        
+
         const returnReason = reasonMap[returnItem.reason] || 'OTHER';
-        const customerNote = returnItem.comment || `Return reason: ${returnItem.reason}`;
-        
+        const customerNote = returnItem.comment || \`Return reason: \${returnItem.reason}\`;
+
         returnLineItems.push({
-          fulfillmentLineItemId: `gid://shopify/FulfillmentLineItem/${fulfillmentLineItemId}`,
+          fulfillmentLineItemId: \`gid://shopify/FulfillmentLineItem/\${fulfillmentOrderLineItemId}\`,
           quantity: returnItem.quantity,
           returnReason: returnReason,
           customerNote: customerNote
         });
       }
-      
+
+      // ✅ IMPROVED: Better error message
       if (returnLineItems.length === 0) {
-        throw new Error('No valid fulfillment line items found for return');
+        return res.status(400).json({
+          error: 'Cannot create return',
+          message: 'Unable to process return for selected items. Please contact support at truewest.info@gmail.com',
+          code: 'NO_VALID_ITEMS',
+          failed_items: failedItems,
+          order_name: order.name
+        });
       }
-      
-      // Step 3: Create return request using GraphQL mutation
-      const mutation = `
+
+      // Step 4: Create return request using GraphQL mutation
+      const mutation = \`
         mutation returnRequest($input: ReturnRequestInput!) {
           returnRequest(input: $input) {
             userErrors {
@@ -108,16 +163,16 @@ module.exports = async (req, res) => {
             }
           }
         }
-      `;
-      
+      \`;
+
       const variables = {
         input: {
-          orderId: `gid://shopify/Order/${order_id}`,
+          orderId: \`gid://shopify/Order/\${order_id}\`,
           returnLineItems: returnLineItems
         }
       };
-      
-      const graphqlRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
+
+      const graphqlRes = await fetch(\`https://\${storeDomain}/admin/api/2024-07/graphql.json\`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
@@ -128,25 +183,27 @@ module.exports = async (req, res) => {
           variables: variables
         })
       });
-      
+
       if (!graphqlRes.ok) {
         const errorText = await graphqlRes.text();
-        throw new Error(`GraphQL request failed: ${errorText}`);
+        throw new Error(\`GraphQL request failed: \${errorText}\`);
       }
-      
+
       const graphqlData = await graphqlRes.json();
-      
+
       if (graphqlData.errors) {
-        throw new Error(`GraphQL errors: ${JSON.stringify(graphqlData.errors)}`);
+        throw new Error(\`GraphQL errors: \${JSON.stringify(graphqlData.errors)}\`);
       }
-      
+
       const returnRequest = graphqlData.data.returnRequest;
-      
+
       if (returnRequest.userErrors && returnRequest.userErrors.length > 0) {
-        throw new Error(`Return creation failed: ${returnRequest.userErrors.map(e => e.message).join(', ')}`);
+        throw new Error(\`Return creation failed: \${returnRequest.userErrors.map(e => e.message).join(', ')}\`);
       }
-      
+
       const createdReturn = returnRequest.return;
+
+      console.log('Return created successfully:', createdReturn.name);
 
       res.json({
         success: true,
@@ -156,7 +213,7 @@ module.exports = async (req, res) => {
         status: createdReturn.status,
         order_name: createdReturn.order.name
       });
-      
+
     } catch (err) {
       console.error('Proxy error (Return):', err.message);
       res.status(500).json({ 
@@ -168,14 +225,14 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== POST: CREATE EXCHANGE DRAFT (FIXED CUSTOM SIZE) ====================
+  // ==================== POST: CREATE EXCHANGE DRAFT (UNCHANGED) ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id && selected_line_items) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
 
       // Count previous exchanges
       const customerOrdersRes = await fetch(
-        `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customer_id}&status=any&limit=250&fields=tags`,
+        \`https://\${storeDomain}/admin/api/2024-07/orders.json?customer_id=\${customer_id}&status=any&limit=250&fields=tags\`,
         { headers: { 'X-Shopify-Access-Token': token } }
       );
       const customerOrders = (await customerOrdersRes.json()).orders || [];
@@ -196,10 +253,10 @@ module.exports = async (req, res) => {
         let variantTitle = 'Custom Size Item';
         let productId = selected.product_id;
         let productTitle = selected.title || 'Custom Item';
-        
+
         // ✅ FIXED: Check for custom size flag instead of null variant
         const isCustom = selected.is_custom_size === true;
-        
+
         // ✅ FIXED: Use original variant ID for custom sizes
         let variantId = selected.original_variant_id;
 
@@ -211,9 +268,9 @@ module.exports = async (req, res) => {
         } else if (selected.variant_id) {
           // Regular size change - fetch new variant details
           variantId = selected.variant_id;
-          
+
           const variantRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/variants/${selected.variant_id}.json`,
+            \`https://\${storeDomain}/admin/api/2024-07/variants/\${selected.variant_id}.json\`,
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           if (variantRes.ok) {
@@ -225,11 +282,11 @@ module.exports = async (req, res) => {
 
         if (productId) {
           const productRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
+            \`https://\${storeDomain}/admin/api/2024-07/products/\${productId}.json\`,
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           if (productRes.ok) {
-            const prodData = await prodRes.json();
+            const prodData = await productRes.json();
             const product = prodData.product;
             productTitle = product.title;
           }
@@ -241,11 +298,11 @@ module.exports = async (req, res) => {
           customProperties = [
             { name: 'Exchange Type', value: 'Custom Size' },
             { name: 'Original Size', value: selected.current_size || 'N/A' },
-            { name: 'Bust', value: `${m.bust || '-'} inches` },
-            { name: 'Waist', value: `${m.waist || '-'} inches` },
-            { name: 'Hips', value: `${m.hips || '-'} inches` },
-            { name: 'Shoulder', value: `${m.shoulder || '-'} inches` },
-            { name: 'Length', value: `${m.length || '-'} inches` }
+            { name: 'Bust', value: \`\${m.bust || '-'} inches\` },
+            { name: 'Waist', value: \`\${m.waist || '-'} inches\` },
+            { name: 'Hips', value: \`\${m.hips || '-'} inches\` },
+            { name: 'Shoulder', value: \`\${m.shoulder || '-'} inches\` },
+            { name: 'Length', value: \`\${m.length || '-'} inches\` }
           ];
         } else {
           customProperties = [
@@ -261,7 +318,7 @@ module.exports = async (req, res) => {
           variant_id: variantId,  // ✅ Now always has a value (original or new)
           quantity: 1,
           price: newPrice.toFixed(2),
-          title: isCustom ? `${productTitle} - Custom Size` : productTitle,
+          title: isCustom ? \`\${productTitle} - Custom Size\` : productTitle,
           properties: customProperties,
           taxable: true,
           requires_shipping: true
@@ -283,7 +340,7 @@ module.exports = async (req, res) => {
 
       if (totalCustomFees > 0) {
         draftLineItems.push({
-          title: `Custom Size Fee (${totalCustomFees / 200} item${totalCustomFees > 200 ? 's' : ''})`,
+          title: \`Custom Size Fee (\${totalCustomFees / 200} item\${totalCustomFees > 200 ? 's' : ''})\`,
           price: totalCustomFees.toFixed(2),
           quantity: 1,
           taxable: false,
@@ -320,7 +377,7 @@ module.exports = async (req, res) => {
 
       const itemSummary = selected_line_items.map((item, idx) => {
         const type = item.is_custom_size ? 'Custom Size' : 'Size Change';
-        return `Item ${idx + 1}: ${item.title} (${type})`;
+        return \`Item \${idx + 1}: \${item.title} (\${type})\`;
       }).join(' | ');
 
       const draftPayload = {
@@ -330,13 +387,13 @@ module.exports = async (req, res) => {
           email: order.email,
           shipping_address: order.shipping_address,
           billing_address: order.billing_address || order.shipping_address,
-          note: `EXCHANGE for Order ${originalOrderName} | ${itemSummary} | Total Items: ${selected_line_items.length}`,
+          note: \`EXCHANGE for Order \${originalOrderName} | \${itemSummary} | Total Items: \${selected_line_items.length}\`,
           tags: draftTags,
           requires_shipping: true
         }
       };
 
-      const draftRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders.json`, {
+      const draftRes = await fetch(\`https://\${storeDomain}/admin/api/2024-07/draft_orders.json\`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
@@ -356,13 +413,13 @@ module.exports = async (req, res) => {
 
       if (original_order_id) {
         try {
-          await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
+          await fetch(\`https://\${storeDomain}/admin/api/2024-07/orders/\${original_order_id}.json\`, {
             method: 'PUT',
             headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               order: {
                 tags: "exchange-in-progress,portal-exchange",
-                note: `EXCHANGE REQUESTED → Draft Order: ${draftOrderName}`
+                note: \`EXCHANGE REQUESTED → Draft Order: \${draftOrderName}\`
               }
             })
           });
@@ -373,7 +430,7 @@ module.exports = async (req, res) => {
 
       if (totalAmountDue <= 0) {
         const completeRes = await fetch(
-          `https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/complete.json`,
+          \`https://\${storeDomain}/admin/api/2024-07/draft_orders/\${draftId}/complete.json\`,
           {
             method: 'PUT',
             headers: { 'X-Shopify-Access-Token': token }
@@ -387,17 +444,17 @@ module.exports = async (req, res) => {
 
         const completeData = await completeRes.json();
         const completedOrder = completeData.draft_order;
-        const completedOrderName = completedOrder.name || `#${completedOrder.order_id}`;
+        const completedOrderName = completedOrder.name || \`#\${completedOrder.order_id}\`;
 
         if (original_order_id) {
           try {
-            await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${original_order_id}.json`, {
+            await fetch(\`https://\${storeDomain}/admin/api/2024-07/orders/\${original_order_id}.json\`, {
               method: 'PUT',
               headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 order: {
                   tags: "exchange-processed,portal-exchange",
-                  note: `EXCHANGED → New Order: ${completedOrderName}`
+                  note: \`EXCHANGED → New Order: \${completedOrderName}\`
                 }
               })
             });
@@ -416,7 +473,7 @@ module.exports = async (req, res) => {
       } else {
         try {
           const invoiceRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/draft_orders/${draftId}/send_invoice.json`,
+            \`https://\${storeDomain}/admin/api/2024-07/draft_orders/\${draftId}/send_invoice.json\`,
             {
               method: 'POST',
               headers: {
@@ -427,13 +484,13 @@ module.exports = async (req, res) => {
                 draft_order_invoice: {
                   to: order.email,
                   from: 'trueweststore@gmail.com',
-                  subject: `Payment Required for Exchange - Order ${originalOrderName}`,
-                  custom_message: `Hi! To complete your exchange, please pay ₹${totalAmountDue.toFixed(2)}. This includes:\n\n` +
-                    (totalPriceDifference > 0 ? `• Price Difference: ₹${totalPriceDifference.toFixed(2)}\n` : '') +
-                    (totalPriceDifference < 0 ? `• Store Credit Applied: ₹${Math.abs(totalPriceDifference).toFixed(2)}\n` : '') +
-                    (totalCustomFees > 0 ? `• Custom Size Fee: ₹${totalCustomFees.toFixed(2)}\n` : '') +
-                    (totalExchangeFees > 0 ? `• Exchange Fee: ₹${totalExchangeFees.toFixed(2)}\n` : '') +
-                    `\nClick the button below to complete payment.`
+                  subject: \`Payment Required for Exchange - Order \${originalOrderName}\`,
+                  custom_message: \`Hi! To complete your exchange, please pay ₹\${totalAmountDue.toFixed(2)}. This includes:\n\n\` +
+                    (totalPriceDifference > 0 ? \`• Price Difference: ₹\${totalPriceDifference.toFixed(2)}\n\` : '') +
+                    (totalPriceDifference < 0 ? \`• Store Credit Applied: ₹\${Math.abs(totalPriceDifference).toFixed(2)}\n\` : '') +
+                    (totalCustomFees > 0 ? \`• Custom Size Fee: ₹\${totalCustomFees.toFixed(2)}\n\` : '') +
+                    (totalExchangeFees > 0 ? \`• Exchange Fee: ₹\${totalExchangeFees.toFixed(2)}\n\` : '') +
+                    \`\nClick the button below to complete payment.\`
                 }
               })
             }
@@ -482,18 +539,18 @@ module.exports = async (req, res) => {
     try {
       if (contact) {
         const contactField = contact.includes('@') ? 'email' : 'phone';
-        const customerUrl = `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(contact)}`;
+        const customerUrl = \`https://\${storeDomain}/admin/api/2024-07/customers/search.json?query=\${contactField}:\${encodeURIComponent(contact)}\`;
         const customerResponse = await fetch(customerUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!customerResponse.ok) throw new Error(await customerResponse.text());
         const customerData = await customerResponse.json();
         if (customerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
         customerId = customerData.customers[0].id;
-        const ordersUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${customerId}&name=#${query}&limit=1`;
+        const ordersUrl = \`https://\${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=\${customerId}&name=#\${query}&limit=1\`;
         const ordersResponse = await fetch(ordersUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!ordersResponse.ok) throw new Error(await ordersResponse.text());
         data = await ordersResponse.json();
       } else {
-        const apiUrl = `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&name=#${query}&limit=1`;
+        const apiUrl = \`https://\${storeDomain}/admin/api/2024-07/orders.json?status=any&name=#\${query}&limit=1\`;
         const response = await fetch(apiUrl, { headers: { 'X-Shopify-Access-Token': token } });
         if (!response.ok) throw new Error(await response.text());
         data = await response.json();
@@ -504,7 +561,7 @@ module.exports = async (req, res) => {
       }
 
       const cleanQuery = query.replace('#', '');
-      const exactOrder = data.orders.find(o => o.name === `#${cleanQuery}` || String(o.order_number) === cleanQuery);
+      const exactOrder = data.orders.find(o => o.name === \`#\${cleanQuery}\` || String(o.order_number) === cleanQuery);
       const order = exactOrder || data.orders[0];
       data.orders = [order];
 
@@ -515,7 +572,7 @@ module.exports = async (req, res) => {
       if (customerId) {
         try {
           const customerOrdersRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&status=any&limit=250&fields=tags`,
+            \`https://\${storeDomain}/admin/api/2024-07/orders.json?customer_id=\${customerId}&status=any&limit=250&fields=tags\`,
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           if (customerOrdersRes.ok) {
@@ -540,13 +597,13 @@ module.exports = async (req, res) => {
       if (fulfillment?.tracking_number) {
         const awb = fulfillment.tracking_number.trim();
         try {
-          const trackUrl = `https://track.eshipz.com/track?awb=${awb}`;
+          const trackUrl = \`https://track.eshipz.com/track?awb=\${awb}\`;
           const trackRes = await fetch(trackUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
             timeout: 10000
           });
           const html = await trackRes.text();
-          
+
           if (html.toLowerCase().includes('delivered')) {
             const patterns = [
               /Delivered.*?(\d{2}\/\d{2}\/\d{4})/i,
@@ -573,7 +630,7 @@ module.exports = async (req, res) => {
             }
           }
         } catch (e) {
-          console.warn(`eShipz tracking failed for AWB ${awb}:`, e.message);
+          console.warn(\`eShipz tracking failed for AWB \${awb}:\`, e.message);
           currentShippingStatus = 'Unknown';
         }
       }
@@ -595,12 +652,12 @@ module.exports = async (req, res) => {
       for (let item of order.line_items) {
         if (item.product_id) {
           const productRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
+            \`https://\${storeDomain}/admin/api/2024-07/products/\${item.product_id}.json?fields=id,title,images,variants\`,
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           const productData = await productRes.json();
           const product = productData.product;
-          
+
           item.image_url = product?.images?.[0]?.src || 'https://via.placeholder.com/80';
           item.available_variants = product?.variants?.map(v => ({
             id: v.id,
@@ -609,7 +666,7 @@ module.exports = async (req, res) => {
             inventory_quantity: v.inventory_quantity,
             available: v.inventory_quantity > 0
           })) || [];
-          
+
           const currentVariant = product?.variants?.find(v => v.id === item.variant_id);
           if (currentVariant) {
             item.current_size = currentVariant.title;
@@ -623,16 +680,16 @@ module.exports = async (req, res) => {
 
       const tags = (order.tags || '').toLowerCase();
       const note = (order.note || '').toLowerCase();
-      
+
       if (tags.includes('exchange-processed') || tags.includes('return-processed')) {
         if (customerId) {
           const allRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${customerId}&limit=250`, 
+            \`https://\${storeDomain}/admin/api/2024-07/orders.json?customer_id=\${customerId}&limit=250\`, 
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           const all = (await allRes.json()).orders || [];
           const replacement = all.find(o => o.note && o.note.toLowerCase().includes(order.name.toLowerCase()));
-          
+
           if (replacement) {
             data.already_processed = true;
             data.exchange_order_name = replacement.name;
@@ -651,7 +708,7 @@ module.exports = async (req, res) => {
         const match = note.match(/exchange for [#]?(\d+)/i);
         if (match) {
           const origRes = await fetch(
-            `https://${storeDomain}/admin/api/2024-07/orders.json?name=#${match[1]}`, 
+            \`https://\${storeDomain}/admin/api/2024-07/orders.json?name=#\${match[1]}\`, 
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           const origData = await origRes.json();
