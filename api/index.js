@@ -14,34 +14,152 @@ module.exports = async (req, res) => {
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // ==================== POST: SUBMIT RETURN REQUEST ====================
+  // ==================== POST: SUBMIT RETURN REQUEST (UPGRADED) ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
-      let orderNote = note;
-      let orderTags = tags || "return-processed,portal-return";
+      // Step 1: Get order details to find fulfillment line item IDs
+      const orderRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
+        headers: { 'X-Shopify-Access-Token': token }
+      });
       
-      if (!orderNote) {
-        const returnReason = return_items[0]?.reason || 'Not specified';
-        const returnComment = return_items[0]?.comment || '';
-        const itemsList = return_items.map(i => i.quantity + 'x line_item ' + i.line_item_id).join(', ');
-        orderNote = `RETURN REQUESTED via Portal | Items: ${itemsList} | Reason: ${returnReason}${returnComment ? ' | Comment: ' + returnComment : ''}`;
+      if (!orderRes.ok) {
+        throw new Error('Unable to fetch order details');
       }
-
-      await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
-        method: 'PUT',
-        headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          order: {
-            tags: orderTags,
-            note: orderNote
+      
+      const orderData = await orderRes.json();
+      const order = orderData.order;
+      
+      // Step 2: Map return items to fulfillment line items
+      const returnLineItems = [];
+      
+      for (const returnItem of return_items) {
+        // Find the line item in order
+        const lineItem = order.line_items.find(li => li.id === returnItem.line_item_id);
+        
+        if (!lineItem) {
+          console.warn(`Line item ${returnItem.line_item_id} not found in order`);
+          continue;
+        }
+        
+        // Find fulfillment line item ID
+        let fulfillmentLineItemId = null;
+        
+        if (order.fulfillments && order.fulfillments.length > 0) {
+          for (const fulfillment of order.fulfillments) {
+            const fli = fulfillment.line_items.find(fli => fli.id === returnItem.line_item_id);
+            if (fli && fli.fulfillment_line_item_id) {
+              fulfillmentLineItemId = fli.fulfillment_line_item_id;
+              break;
+            }
           }
+        }
+        
+        if (!fulfillmentLineItemId) {
+          console.warn(`Fulfillment line item not found for line item ${returnItem.line_item_id}`);
+          continue;
+        }
+        
+        // Map reason to Shopify return reason enum
+        const reasonMap = {
+          'size': 'SIZE_TOO_SMALL',
+          'defective': 'DEFECTIVE',
+          'quality': 'NOT_AS_DESCRIBED',
+          'other': 'OTHER'
+        };
+        
+        const returnReason = reasonMap[returnItem.reason] || 'OTHER';
+        const customerNote = returnItem.comment || `Return reason: ${returnItem.reason}`;
+        
+        returnLineItems.push({
+          fulfillmentLineItemId: `gid://shopify/FulfillmentLineItem/${fulfillmentLineItemId}`,
+          quantity: returnItem.quantity,
+          returnReason: returnReason,
+          customerNote: customerNote
+        });
+      }
+      
+      if (returnLineItems.length === 0) {
+        throw new Error('No valid fulfillment line items found for return');
+      }
+      
+      // Step 3: Create return request using GraphQL mutation
+      const mutation = `
+        mutation returnRequest($input: ReturnRequestInput!) {
+          returnRequest(input: $input) {
+            userErrors {
+              field
+              message
+            }
+            return {
+              id
+              name
+              status
+              returnLineItems(first: 10) {
+                edges {
+                  node {
+                    id
+                    returnReason
+                    customerNote
+                    quantity
+                  }
+                }
+              }
+              order {
+                id
+                name
+              }
+            }
+          }
+        }
+      `;
+      
+      const variables = {
+        input: {
+          orderId: `gid://shopify/Order/${order_id}`,
+          returnLineItems: returnLineItems
+        }
+      };
+      
+      const graphqlRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          query: mutation,
+          variables: variables
         })
       });
+      
+      if (!graphqlRes.ok) {
+        const errorText = await graphqlRes.text();
+        throw new Error(`GraphQL request failed: ${errorText}`);
+      }
+      
+      const graphqlData = await graphqlRes.json();
+      
+      if (graphqlData.errors) {
+        throw new Error(`GraphQL errors: ${JSON.stringify(graphqlData.errors)}`);
+      }
+      
+      const returnRequest = graphqlData.data.returnRequest;
+      
+      if (returnRequest.userErrors && returnRequest.userErrors.length > 0) {
+        throw new Error(`Return creation failed: ${returnRequest.userErrors.map(e => e.message).join(', ')}`);
+      }
+      
+      const createdReturn = returnRequest.return;
 
       res.json({
         success: true,
-        message: "Return request created successfully!"
+        message: "Return request created successfully!",
+        return_id: createdReturn.id,
+        return_name: createdReturn.name,
+        status: createdReturn.status,
+        order_name: createdReturn.order.name
       });
+      
     } catch (err) {
       console.error('Proxy error (Return):', err.message);
       res.status(500).json({ 
@@ -53,7 +171,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== POST: CREATE EXCHANGE DRAFT ====================
+  // ==================== POST: CREATE EXCHANGE DRAFT (UNCHANGED) ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id && selected_line_items) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
@@ -142,7 +260,7 @@ module.exports = async (req, res) => {
         const priceDiff = newPrice - originalPrice;
         totalPriceDifference += priceDiff;
 
-        // FIX: Custom size ₹200 ALWAYS applies (even on first exchange)
+        // Custom size ₹200 ALWAYS applies
         if (isCustom) {
           totalCustomFees += 200;
         }
@@ -345,7 +463,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== GET: FETCH ORDER ====================
+  // ==================== GET: FETCH ORDER (UNCHANGED) ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
