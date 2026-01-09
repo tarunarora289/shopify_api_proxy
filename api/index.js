@@ -4,122 +4,124 @@ module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
   }
 
   const { query, contact } = req.query || {};
-  const { action, order, customer_id, order_id, return_items, selected_line_items, original_order_id, note, tags } = req.body || {};
+  const { action, order, customer_id, order_id, return_items, selected_line_items, original_order_id } = req.body || {};
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // ==================== POST: SUBMIT RETURN REQUEST (✅ FIXED FOR COD) ====================
+  // ==================== POST: SUBMIT RETURN REQUEST (✅ ENTERPRISE APPROACH) ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
-      // Step 1: Get order details
-      const orderRes = await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
-        headers: { 'X-Shopify-Access-Token': token }
+      // ✅ STEP 1: Query returnable fulfillments using GraphQL (Shopify's recommended approach)
+      const returnableQuery = `
+        query returnableFulfillmentsQuery($orderId: ID!) {
+          returnableFulfillments(orderId: $orderId, first: 10) {
+            edges {
+              node {
+                id
+                fulfillment {
+                  id
+                }
+                returnableFulfillmentLineItems(first: 50) {
+                  edges {
+                    node {
+                      fulfillmentLineItem {
+                        id
+                        lineItem {
+                          id
+                        }
+                      }
+                      quantity
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const returnableRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          query: returnableQuery,
+          variables: { orderId: `gid://shopify/Order/${order_id}` }
+        })
       });
 
-      if (!orderRes.ok) {
-        throw new Error('Unable to fetch order details');
+      if (!returnableRes.ok) {
+        const errorText = await returnableRes.text();
+        throw new Error(`GraphQL request failed (${returnableRes.status}): ${errorText}`);
       }
 
-      const orderData = await orderRes.json();
-      const order = orderData.order;
+      const returnableData = await returnableRes.json();
 
-      // ✅ NEW: Step 2: Fetch Fulfillment Orders separately (better for COD)
-      const foRes = await fetch(
-        `https://${storeDomain}/admin/api/2024-07/fulfillment_orders.json?order_id=${order_id}`,
-        { headers: { 'X-Shopify-Access-Token': token } }
-      );
-
-      if (!foRes.ok) {
-        throw new Error('Unable to fetch fulfillment orders');
+      if (returnableData.errors) {
+        throw new Error(`GraphQL errors: ${JSON.stringify(returnableData.errors)}`);
       }
 
-      const foData = await foRes.json();
-      const fulfillmentOrders = foData.fulfillment_orders || [];
+      const returnableFulfillments = returnableData.data?.returnableFulfillments?.edges || [];
 
-      // ✅ NEW: Debug logging
       console.log('=== RETURN REQUEST DEBUG ===');
-      console.log('Order:', order.name);
-      console.log('Financial Status:', order.financial_status);
-      console.log('Fulfillment Status:', order.fulfillment_status);
-      console.log('Fulfillment Orders:', fulfillmentOrders.length);
-      console.log('FO Details:', JSON.stringify(fulfillmentOrders.map(fo => ({
-        id: fo.id,
-        status: fo.status,
-        line_items_count: fo.line_items?.length
-      })), null, 2));
+      console.log('Order ID:', order_id);
+      console.log('Returnable Fulfillments Found:', returnableFulfillments.length);
 
-      // ✅ IMPROVED: Find fulfilled fulfillment order (more lenient)
-      const fulfilledFO = fulfillmentOrders.find(fo => 
-        fo.status === 'fulfilled' || 
-        fo.status === 'in_progress' ||
-        fo.status === 'scheduled' ||
-        fo.status === 'open'
-      );
-
-      // ✅ IMPROVED: Better fallback check
-      if (!fulfilledFO && order.fulfillment_status !== 'fulfilled') {
+      // ✅ Check if order has any returnable fulfillments
+      if (returnableFulfillments.length === 0) {
         return res.status(400).json({
-          error: 'Order not fulfilled',
-          message: 'Your order has not been delivered yet. Returns can only be created after delivery.',
-          code: 'ORDER_NOT_FULFILLED',
-          order_name: order.name
+          error: 'Order not eligible for return',
+          message: 'Your order has not been delivered yet or is not eligible for returns.',
+          code: 'NO_RETURNABLE_FULFILLMENTS'
         });
       }
 
-      // ✅ IMPROVED: Handle case where order is fulfilled but no FO found
-      if (!fulfilledFO) {
-        console.warn('Order marked fulfilled but no fulfillment order found');
-        return res.status(400).json({
-          error: 'Cannot process return',
-          message: 'Unable to find fulfillment details for this order. Please contact support at truewest.info@gmail.com',
-          code: 'NO_FULFILLMENT_ORDER',
-          order_name: order.name
-        });
-      }
+      // ✅ STEP 2: Build line item mapping (fulfillment line item ID → line item ID)
+      const fulfillmentLineItemMap = {};
+      const lineItemToFulfillmentMap = {};
 
-      // ✅ NEW: Create line item mapping
-      const lineItemMapping = {};
-      fulfilledFO.line_items.forEach(foli => {
-        lineItemMapping[foli.line_item_id] = foli.id;
+      returnableFulfillments.forEach(edge => {
+        const returnableItems = edge.node.returnableFulfillmentLineItems.edges || [];
+        returnableItems.forEach(item => {
+          const fliId = item.node.fulfillmentLineItem.id;
+          const liId = item.node.fulfillmentLineItem.lineItem.id;
+          const cleanFliId = fliId.split('/').pop();
+          const cleanLiId = liId.split('/').pop();
+
+          fulfillmentLineItemMap[cleanFliId] = item.node.fulfillmentLineItem;
+          lineItemToFulfillmentMap[cleanLiId] = fliId; // Store full GID
+        });
       });
 
-      console.log('Line Item Mapping:', lineItemMapping);
+      console.log('Line Item Mapping:', lineItemToFulfillmentMap);
 
-      // Step 3: Map return items to fulfillment line items
+      // ✅ STEP 3: Build return line items from frontend payload
       const returnLineItems = [];
       const failedItems = [];
 
       for (const returnItem of return_items) {
-        const lineItem = order.line_items.find(li => li.id === returnItem.line_item_id);
+        const lineItemId = String(returnItem.line_item_id); // Convert to string for comparison
+        const fulfillmentLineItemId = lineItemToFulfillmentMap[lineItemId];
 
-        if (!lineItem) {
-          console.warn(`Line item ${returnItem.line_item_id} not found in order`);
-          failedItems.push({ 
-            item_id: returnItem.line_item_id, 
-            reason: 'Line item not found in order' 
-          });
-          continue;
-        }
-
-        // ✅ CHANGED: Use the mapped fulfillment order line item ID
-        const fulfillmentOrderLineItemId = lineItemMapping[returnItem.line_item_id];
-
-        if (!fulfillmentOrderLineItemId) {
-          console.warn(`Fulfillment line item not found for line item ${returnItem.line_item_id}`);
+        if (!fulfillmentLineItemId) {
+          console.warn(`No returnable fulfillment found for line item ${lineItemId}`);
           failedItems.push({
-            item_id: returnItem.line_item_id,
-            title: lineItem.title,
-            reason: 'Fulfillment line item not found'
+            line_item_id: lineItemId,
+            reason: 'Item not eligible for return or not yet fulfilled'
           });
           continue;
         }
 
+        // ✅ Map frontend reasons to Shopify enum values
         const reasonMap = {
           'size': 'SIZE_TOO_SMALL',
           'defective': 'DEFECTIVE',
@@ -131,26 +133,25 @@ module.exports = async (req, res) => {
         const customerNote = returnItem.comment || `Return reason: ${returnItem.reason}`;
 
         returnLineItems.push({
-          fulfillmentLineItemId: `gid://shopify/FulfillmentLineItem/${fulfillmentOrderLineItemId}`,
-          quantity: returnItem.quantity,
+          fulfillmentLineItemId: fulfillmentLineItemId, // Already in GID format
+          quantity: returnItem.quantity || 1,
           returnReason: returnReason,
           customerNote: customerNote
         });
       }
 
-      // ✅ IMPROVED: Better error message
+      // ✅ Validate we have items to return
       if (returnLineItems.length === 0) {
         return res.status(400).json({
           error: 'Cannot create return',
-          message: 'Unable to process return for selected items. Please contact support at truewest.info@gmail.com',
+          message: 'No eligible items found for return. Please contact support at truewest.info@gmail.com',
           code: 'NO_VALID_ITEMS',
-          failed_items: failedItems,
-          order_name: order.name
+          failed_items: failedItems
         });
       }
 
-      // Step 4: Create return request using GraphQL mutation
-      const mutation = `
+      // ✅ STEP 4: Create return using returnRequest mutation (Shopify's official approach)
+      const returnRequestMutation = `
         mutation returnRequest($input: ReturnRequestInput!) {
           returnRequest(input: $input) {
             userErrors {
@@ -161,7 +162,7 @@ module.exports = async (req, res) => {
               id
               name
               status
-              returnLineItems(first: 10) {
+              returnLineItems(first: 50) {
                 edges {
                   node {
                     id
@@ -187,38 +188,60 @@ module.exports = async (req, res) => {
         }
       };
 
-      const graphqlRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
+      const returnRequestRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
         method: 'POST',
         headers: {
           'X-Shopify-Access-Token': token,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          query: mutation,
+          query: returnRequestMutation,
           variables: variables
         })
       });
 
-      if (!graphqlRes.ok) {
-        const errorText = await graphqlRes.text();
-        throw new Error(`GraphQL request failed: ${errorText}`);
+      if (!returnRequestRes.ok) {
+        const errorText = await returnRequestRes.text();
+        throw new Error(`Return request failed (${returnRequestRes.status}): ${errorText}`);
       }
 
-      const graphqlData = await graphqlRes.json();
+      const returnRequestData = await returnRequestRes.json();
 
-      if (graphqlData.errors) {
-        throw new Error(`GraphQL errors: ${JSON.stringify(graphqlData.errors)}`);
+      if (returnRequestData.errors) {
+        throw new Error(`GraphQL errors: ${JSON.stringify(returnRequestData.errors)}`);
       }
 
-      const returnRequest = graphqlData.data.returnRequest;
+      const returnRequest = returnRequestData.data.returnRequest;
 
       if (returnRequest.userErrors && returnRequest.userErrors.length > 0) {
-        throw new Error(`Return creation failed: ${returnRequest.userErrors.map(e => e.message).join(', ')}`);
+        const errorMessages = returnRequest.userErrors.map(e => e.message).join(', ');
+        throw new Error(`Return creation failed: ${errorMessages}`);
       }
 
       const createdReturn = returnRequest.return;
 
-      console.log('Return created successfully:', createdReturn.name);
+      console.log('✅ Return created successfully:', createdReturn.name);
+
+      // ✅ Update original order with return tag
+      if (order_id) {
+        try {
+          await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${order_id}.json`, {
+            method: 'PUT',
+            headers: { 
+              'X-Shopify-Access-Token': token, 
+              'Content-Type': 'application/json' 
+            },
+            body: JSON.stringify({
+              order: {
+                tags: "return-requested,portal-created",
+                note: `RETURN REQUESTED via Portal → Return: ${createdReturn.name}`
+              }
+            })
+          });
+        } catch (tagErr) {
+          console.warn('Warning: Could not tag original order:', tagErr.message);
+        }
+      }
 
       res.json({
         success: true,
@@ -230,7 +253,7 @@ module.exports = async (req, res) => {
       });
 
     } catch (err) {
-      console.error('Proxy error (Return):', err.message);
+      console.error('❌ Return request error:', err.message);
       res.status(500).json({ 
         error: 'Return failed: ' + err.message,
         code: 'RETURN_ERROR',
@@ -269,19 +292,14 @@ module.exports = async (req, res) => {
         let productId = selected.product_id;
         let productTitle = selected.title || 'Custom Item';
 
-        // ✅ FIXED: Check for custom size flag instead of null variant
         const isCustom = selected.is_custom_size === true;
-
-        // ✅ FIXED: Use original variant ID for custom sizes
         let variantId = selected.original_variant_id;
 
         if (isCustom) {
           hasCustomSize = true;
-          // For custom size, use original variant to maintain product link
           variantId = selected.original_variant_id;
           variantTitle = 'Custom Size';
         } else if (selected.variant_id) {
-          // Regular size change - fetch new variant details
           variantId = selected.variant_id;
 
           const variantRes = await fetch(
@@ -327,10 +345,9 @@ module.exports = async (req, res) => {
           ];
         }
 
-        // ✅ FIXED: Always use a valid variant_id
         draftLineItems.push({
           product_id: productId,
-          variant_id: variantId,  // ✅ Now always has a value (original or new)
+          variant_id: variantId,
           quantity: 1,
           price: newPrice.toFixed(2),
           title: isCustom ? `${productTitle} - Custom Size` : productTitle,
@@ -342,13 +359,11 @@ module.exports = async (req, res) => {
         const priceDiff = newPrice - originalPrice;
         totalPriceDifference += priceDiff;
 
-        // Custom size ₹200 ALWAYS applies
         if (isCustom) {
           totalCustomFees += 200;
         }
       }
 
-      // Exchange fee FREE on first, ₹200 from 2nd onwards
       if (!isFirstExchange) {
         totalExchangeFees += 200;
       }
@@ -474,7 +489,7 @@ module.exports = async (req, res) => {
               })
             });
           } catch (updateErr) {
-            console.warn('Warning: Could not update original order with completed order number:', updateErr.message);
+            console.warn('Warning: Could not update original order:', updateErr.message);
           }
         }
 
@@ -535,7 +550,7 @@ module.exports = async (req, res) => {
       }
 
     } catch (err) {
-      console.error('Proxy error (POST):', err.message);
+      console.error('Proxy error (Exchange):', err.message);
       res.status(500).json({ 
         error: 'Exchange failed: ' + err.message,
         code: 'EXCHANGE_ERROR',
@@ -620,10 +635,9 @@ module.exports = async (req, res) => {
 
           if (html.toLowerCase().includes('delivered')) {
             const patterns = [
-              /Delivered.*?(\d{2}\/\d{2}\/\d{4})/i,
-              /Delivered on.*?(\d{2}\/\d{2}\/\d{4})/i,
-              /Delivered.*?(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
-              /Delivered.*?(\d{4}-\d{2}-\d{2})/i
+              /(\d{2}\/\d{2}\/\d{4})/i,
+              /(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
+              /(\d{4}-\d{2}-\d{2})/i
             ];
             let deliveryMatch = null;
             for (const pattern of patterns) {
@@ -633,19 +647,15 @@ module.exports = async (req, res) => {
             if (deliveryMatch) {
               actualDeliveryDate = deliveryMatch[1];
               currentShippingStatus = 'Delivered';
-            } else {
-              currentShippingStatus = 'In Transit';
             }
-          } else {
-            if (html.toLowerCase().includes('in transit') || html.includes('out for delivery') || html.includes('dispatched')) {
-              currentShippingStatus = 'In Transit';
-            } else if (html.toLowerCase().includes('picked up') || html.includes('pickup')) {
-              currentShippingStatus = 'Picked Up';
-            }
+          } else if (html.toLowerCase().includes('in transit') || html.includes('dispatched')) {
+            currentShippingStatus = 'In Transit';
+          } else if (html.toLowerCase().includes('picked up')) {
+            currentShippingStatus = 'Picked Up';
           }
         } catch (e) {
-          console.warn(`eShipz tracking failed for AWB ${awb}:`, e.message);
-          currentShippingStatus = 'Unknown';
+          console.warn(`Tracking failed for AWB ${awb}:`, e.message);
+          currentShippingStatus = order.fulfillment_status === 'fulfilled' ? 'Delivered' : 'Unknown';
         }
       }
 
