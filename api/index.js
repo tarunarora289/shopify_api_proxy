@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // ==================== POST: SUBMIT RETURN REQUEST (UPGRADED) ====================
+  // ==================== POST: SUBMIT RETURN REQUEST (UPGRADED WITH SHOPIFY API) ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
       // Step 1: Get order details to find fulfillment line item IDs
@@ -33,7 +33,6 @@ module.exports = async (req, res) => {
       const returnLineItems = [];
       
       for (const returnItem of return_items) {
-        // Find the line item in order
         const lineItem = order.line_items.find(li => li.id === returnItem.line_item_id);
         
         if (!lineItem) {
@@ -41,7 +40,6 @@ module.exports = async (req, res) => {
           continue;
         }
         
-        // Find fulfillment line item ID
         let fulfillmentLineItemId = null;
         
         if (order.fulfillments && order.fulfillments.length > 0) {
@@ -59,7 +57,6 @@ module.exports = async (req, res) => {
           continue;
         }
         
-        // Map reason to Shopify return reason enum
         const reasonMap = {
           'size': 'SIZE_TOO_SMALL',
           'defective': 'DEFECTIVE',
@@ -171,7 +168,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== POST: CREATE EXCHANGE DRAFT (UNCHANGED) ====================
+  // ==================== POST: CREATE EXCHANGE DRAFT (FIXED CUSTOM SIZE) ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id && selected_line_items) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
@@ -199,11 +196,22 @@ module.exports = async (req, res) => {
         let variantTitle = 'Custom Size Item';
         let productId = selected.product_id;
         let productTitle = selected.title || 'Custom Item';
-        const isCustom = !selected.variant_id;
+        
+        // ✅ FIXED: Check for custom size flag instead of null variant
+        const isCustom = selected.is_custom_size === true;
+        
+        // ✅ FIXED: Use original variant ID for custom sizes
+        let variantId = selected.original_variant_id;
 
-        if (isCustom) hasCustomSize = true;
-
-        if (selected.variant_id) {
+        if (isCustom) {
+          hasCustomSize = true;
+          // For custom size, use original variant to maintain product link
+          variantId = selected.original_variant_id;
+          variantTitle = 'Custom Size';
+        } else if (selected.variant_id) {
+          // Regular size change - fetch new variant details
+          variantId = selected.variant_id;
+          
           const variantRes = await fetch(
             `https://${storeDomain}/admin/api/2024-07/variants/${selected.variant_id}.json`,
             { headers: { 'X-Shopify-Access-Token': token } }
@@ -215,13 +223,13 @@ module.exports = async (req, res) => {
           }
         }
 
-        if (isCustom && productId) {
+        if (productId) {
           const productRes = await fetch(
             `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
             { headers: { 'X-Shopify-Access-Token': token } }
           );
           if (productRes.ok) {
-            const prodData = await productRes.json();
+            const prodData = await prodRes.json();
             const product = prodData.product;
             productTitle = product.title;
           }
@@ -232,6 +240,7 @@ module.exports = async (req, res) => {
           const m = selected.custom_measurements;
           customProperties = [
             { name: 'Exchange Type', value: 'Custom Size' },
+            { name: 'Original Size', value: selected.current_size || 'N/A' },
             { name: 'Bust', value: `${m.bust || '-'} inches` },
             { name: 'Waist', value: `${m.waist || '-'} inches` },
             { name: 'Hips', value: `${m.hips || '-'} inches` },
@@ -246,9 +255,10 @@ module.exports = async (req, res) => {
           ];
         }
 
+        // ✅ FIXED: Always use a valid variant_id
         draftLineItems.push({
           product_id: productId,
-          variant_id: selected.variant_id || null,
+          variant_id: variantId,  // ✅ Now always has a value (original or new)
           quantity: 1,
           price: newPrice.toFixed(2),
           title: isCustom ? `${productTitle} - Custom Size` : productTitle,
@@ -309,7 +319,7 @@ module.exports = async (req, res) => {
       }
 
       const itemSummary = selected_line_items.map((item, idx) => {
-        const type = item.variant_id ? 'Size Change' : 'Custom Size';
+        const type = item.is_custom_size ? 'Custom Size' : 'Size Change';
         return `Item ${idx + 1}: ${item.title} (${type})`;
       }).join(' | ');
 
