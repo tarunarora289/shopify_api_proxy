@@ -263,7 +263,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== POST: CREATE EXCHANGE DRAFT (UNCHANGED) ====================
+  // ==================== POST: CREATE EXCHANGE DRAFT (✅ FIXED - PRODUCT PRICE = 0) ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id && selected_line_items) {
     try {
       const originalOrderName = order.name || 'Unknown Order';
@@ -349,7 +349,7 @@ module.exports = async (req, res) => {
           product_id: productId,
           variant_id: variantId,
           quantity: 1,
-          price: newPrice.toFixed(2),
+          price: "0.00",
           title: isCustom ? `${productTitle} - Custom Size` : productTitle,
           properties: customProperties,
           taxable: true,
