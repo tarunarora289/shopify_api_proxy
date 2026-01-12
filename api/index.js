@@ -15,7 +15,7 @@ module.exports = async (req, res) => {
   const token = process.env.SHOPIFY_API_TOKEN;
   const storeDomain = 'trueweststore.myshopify.com';
 
-  // ==================== POST: SUBMIT RETURN REQUEST (✅ ENTERPRISE APPROACH) ====================
+  // ==================== POST: SUBMIT RETURN REQUEST (✅ UNCHANGED) ====================
   if (req.method === 'POST' && action === 'submit_return' && order_id && return_items) {
     try {
       // ✅ STEP 1: Query returnable fulfillments using GraphQL (Shopify's recommended approach)
@@ -560,7 +560,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== GET: FETCH ORDER (UNCHANGED) ====================
+  // ==================== GET: FETCH ORDER (✅ FIXED - CARRIER-BASED DELIVERY DETECTION) ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
@@ -620,47 +620,94 @@ module.exports = async (req, res) => {
         data.exchange_count = 0;
       }
 
+      // ✅ FIXED: CARRIER-BASED DELIVERY DETECTION
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
 
-      if (fulfillment?.tracking_number) {
-        const awb = fulfillment.tracking_number.trim();
-        try {
-          const trackUrl = `https://track.eshipz.com/track?awb=${awb}`;
-          const trackRes = await fetch(trackUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-          });
-          const html = await trackRes.text();
-
-          if (html.toLowerCase().includes('delivered')) {
-            const patterns = [
-              /(\d{2}\/\d{2}\/\d{4})/i,
-              /(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
-              /(\d{4}-\d{2}-\d{2})/i
-            ];
-            let deliveryMatch = null;
-            for (const pattern of patterns) {
-              deliveryMatch = html.match(pattern);
-              if (deliveryMatch) break;
+      if (fulfillment) {
+        const trackingCompany = (fulfillment.tracking_company || '').toLowerCase();
+        const trackingNumber = fulfillment.tracking_number?.trim();
+        const shipmentStatus = fulfillment.shipment_status;
+        
+        const isDelhivery = trackingCompany.includes('delhivery');
+        const isBluedart = trackingCompany.includes('bluedart') || trackingCompany.includes('blue dart');
+        
+        // ========== DELHIVERY: USE SHOPIFY DATA ==========
+        if (isDelhivery) {
+          if (shipmentStatus === 'delivered' || order.fulfillment_status === 'fulfilled') {
+            currentShippingStatus = 'Delivered';
+            
+            if (fulfillment.updated_at) {
+              const deliveryDate = new Date(fulfillment.updated_at);
+              actualDeliveryDate = deliveryDate.toISOString().split('T')[0];
             }
-            if (deliveryMatch) {
-              actualDeliveryDate = deliveryMatch[1];
-              currentShippingStatus = 'Delivered';
-            }
-          } else if (html.toLowerCase().includes('in transit') || html.includes('dispatched')) {
+          } else if (shipmentStatus === 'in_transit') {
             currentShippingStatus = 'In Transit';
-          } else if (html.toLowerCase().includes('picked up')) {
-            currentShippingStatus = 'Picked Up';
+          } else if (shipmentStatus === 'out_for_delivery') {
+            currentShippingStatus = 'Out for Delivery';
           }
-        } catch (e) {
-          console.warn(`Tracking failed for AWB ${awb}:`, e.message);
-          currentShippingStatus = order.fulfillment_status === 'fulfilled' ? 'Delivered' : 'Unknown';
+        }
+        
+        // ========== BLUEDART: USE ESHIPZ TRACKING ==========
+        else if (isBluedart && trackingNumber) {
+          try {
+            const trackUrl = `https://track.eshipz.com/track?awb=${trackingNumber}`;
+            const trackRes = await fetch(trackUrl, {
+              headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+            });
+            const html = await trackRes.text();
+            const lowerHtml = html.toLowerCase();
+
+            if (lowerHtml.includes('delivered')) {
+              const patterns = [
+                /(\d{2}\/\d{2}\/\d{4})/i,
+                /(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
+                /(\d{4}-\d{2}-\d{2})/i
+              ];
+              
+              let deliveryMatch = null;
+              for (const pattern of patterns) {
+                deliveryMatch = html.match(pattern);
+                if (deliveryMatch) break;
+              }
+              
+              if (deliveryMatch) {
+                actualDeliveryDate = deliveryMatch[1];
+                currentShippingStatus = 'Delivered';
+              }
+            } else if (lowerHtml.includes('in transit') || lowerHtml.includes('dispatched')) {
+              currentShippingStatus = 'In Transit';
+            } else if (lowerHtml.includes('picked up')) {
+              currentShippingStatus = 'Picked Up';
+            }
+          } catch (e) {
+            console.warn(`Tracking failed for AWB ${trackingNumber}:`, e.message);
+            
+            if (order.fulfillment_status === 'fulfilled') {
+              currentShippingStatus = 'Delivered';
+              if (fulfillment.updated_at) {
+                actualDeliveryDate = new Date(fulfillment.updated_at).toISOString().split('T')[0];
+              }
+            } else {
+              currentShippingStatus = 'Unknown';
+            }
+          }
+        }
+        
+        // ========== UNKNOWN CARRIER: FALLBACK ==========
+        else {
+          if (order.fulfillment_status === 'fulfilled') {
+            currentShippingStatus = 'Delivered';
+            if (fulfillment.updated_at) {
+              actualDeliveryDate = new Date(fulfillment.updated_at).toISOString().split('T')[0];
+            }
+          }
         }
       }
 
-      order.actual_delivery_date = actualDeliveryDate || null;
-      order.delivered_at = actualDeliveryDate || null;
+      order.actual_delivery_date = actualDeliveryDate;
+      order.delivered_at = actualDeliveryDate;
       order.current_shipping_status = currentShippingStatus;
 
       const created = new Date(order.created_at);
