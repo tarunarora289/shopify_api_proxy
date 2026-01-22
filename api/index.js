@@ -263,9 +263,21 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== POST: CREATE EXCHANGE DRAFT (✅ FIXED - PRODUCT PRICE = 0) ====================
+  // ==================== POST: CREATE EXCHANGE DRAFT (✅ FIXED - CUSTOM SIZE CAPTURE) ====================
   if (req.method === 'POST' && action === 'submit_exchange' && order && customer_id && selected_line_items) {
     try {
+      // ✅ DEBUG: Log incoming data to verify custom measurements
+      console.log('=== EXCHANGE REQUEST RECEIVED ===');
+      console.log('Number of items:', selected_line_items.length);
+      selected_line_items.forEach((item, idx) => {
+        console.log(`Item ${idx + 1}:`, {
+          title: item.title,
+          is_custom_size: item.is_custom_size,
+          has_measurements: !!item.custom_measurements,
+          measurements: item.custom_measurements
+        });
+      });
+
       const originalOrderName = order.name || 'Unknown Order';
 
       // Count previous exchanges
@@ -286,9 +298,15 @@ module.exports = async (req, res) => {
       let hasCustomSize = false;
 
       for (const selected of selected_line_items) {
+        // ✅ DEBUG: Log each item processing
+        console.log('=== PROCESSING ITEM ===');
+        console.log('Title:', selected.title);
+        console.log('is_custom_size:', selected.is_custom_size);
+        console.log('custom_measurements:', JSON.stringify(selected.custom_measurements));
+
         const originalPrice = parseFloat(selected.price || 0);
         let newPrice = originalPrice;
-        let variantTitle = 'Custom Size Item';
+        let variantTitle = 'N/A';
         let productId = selected.product_id;
         let productTitle = selected.title || 'Custom Item';
 
@@ -299,6 +317,7 @@ module.exports = async (req, res) => {
           hasCustomSize = true;
           variantId = selected.original_variant_id;
           variantTitle = 'Custom Size';
+          console.log('✅ Identified as CUSTOM SIZE');
         } else if (selected.variant_id) {
           variantId = selected.variant_id;
 
@@ -309,7 +328,7 @@ module.exports = async (req, res) => {
           if (variantRes.ok) {
             const variantData = await variantRes.json();
             newPrice = parseFloat(variantData.variant.price || originalPrice);
-            variantTitle = variantData.variant.title || 'Selected Size';
+            variantTitle = variantData.variant.title || 'N/A';
           }
         }
 
@@ -325,6 +344,7 @@ module.exports = async (req, res) => {
           }
         }
 
+        // ✅ FIXED: Custom size properties with measurements
         let customProperties = [];
         if (isCustom && selected.custom_measurements) {
           const m = selected.custom_measurements;
@@ -337,12 +357,14 @@ module.exports = async (req, res) => {
             { name: 'Shoulder', value: `${m.shoulder || '-'} inches` },
             { name: 'Length', value: `${m.length || '-'} inches` }
           ];
+          console.log('✅ Custom measurements captured in properties:', customProperties);
         } else {
           customProperties = [
             { name: 'Exchange Type', value: 'Size Change' },
             { name: 'Original Size', value: selected.current_size || 'N/A' },
             { name: 'New Size', value: variantTitle }
           ];
+          console.log('ℹ️ Regular size change properties:', customProperties);
         }
 
         draftLineItems.push({
@@ -410,6 +432,22 @@ module.exports = async (req, res) => {
         return `Item ${idx + 1}: ${item.title} (${type})`;
       }).join(' | ');
 
+      // ✅ IMPROVED: Add custom measurements to order note for visibility
+      let orderNote = `EXCHANGE for Order ${originalOrderName} | ${itemSummary} | Total Items: ${selected_line_items.length}`;
+
+      const customSizeDetails = selected_line_items
+        .filter(item => item.is_custom_size && item.custom_measurements)
+        .map((item, idx) => {
+          const m = item.custom_measurements;
+          return `\n\nCUSTOM SIZE ${idx + 1}: ${item.title}\nBust: ${m.bust || 'N/A'}" | Waist: ${m.waist || 'N/A'}" | Hips: ${m.hips || 'N/A'}" | Shoulder: ${m.shoulder || 'N/A'}" | Length: ${m.length || 'N/A'}"`;
+        })
+        .join('');
+
+      if (customSizeDetails) {
+        orderNote += customSizeDetails;
+        console.log('✅ Custom measurements added to order note');
+      }
+
       const draftPayload = {
         draft_order: {
           line_items: draftLineItems,
@@ -417,11 +455,13 @@ module.exports = async (req, res) => {
           email: order.email,
           shipping_address: order.shipping_address,
           billing_address: order.billing_address || order.shipping_address,
-          note: `EXCHANGE for Order ${originalOrderName} | ${itemSummary} | Total Items: ${selected_line_items.length}`,
+          note: orderNote,
           tags: draftTags,
           requires_shipping: true
         }
       };
+
+      console.log('📤 Creating draft order with payload...');
 
       const draftRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders.json`, {
         method: 'POST',
@@ -440,6 +480,8 @@ module.exports = async (req, res) => {
       const draftData = await draftRes.json();
       const draftId = draftData.draft_order.id;
       const draftOrderName = draftData.draft_order.name;
+
+      console.log('✅ Draft order created:', draftOrderName);
 
       if (original_order_id) {
         try {
@@ -560,7 +602,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ==================== GET: FETCH ORDER (✅ FIXED - CARRIER-BASED DELIVERY DETECTION) ====================
+  // ==================== GET: FETCH ORDER (✅ UNCHANGED) ====================
   if (req.method === 'GET') {
     if (!query) return res.status(400).json({ error: 'Missing query parameter' });
     let data;
@@ -620,7 +662,7 @@ module.exports = async (req, res) => {
         data.exchange_count = 0;
       }
 
-      // ✅ FIXED: CARRIER-BASED DELIVERY DETECTION
+      // ✅ CARRIER-BASED DELIVERY DETECTION
       const fulfillment = order.fulfillments?.[0];
       let actualDeliveryDate = null;
       let currentShippingStatus = 'Processing';
