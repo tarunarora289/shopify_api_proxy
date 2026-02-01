@@ -691,51 +691,103 @@ module.exports = async (req, res) => {
           }
         }
         
-        // ========== BLUEDART: USE ESHIPZ TRACKING ==========
-        else if (isBluedart && trackingNumber) {
-          try {
-            const trackUrl = `https://track.eshipz.com/track?awb=${trackingNumber}`;
-            const trackRes = await fetch(trackUrl, {
-              headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-            });
-            const html = await trackRes.text();
-            const lowerHtml = html.toLowerCase();
-
-            if (lowerHtml.includes('delivered')) {
-              const patterns = [
-                /(\d{2}\/\d{2}\/\d{4})/i,
-                /(\d{1,2}\s[A-Za-z]{3,9}\s\d{4})/i,
-                /(\d{4}-\d{2}-\d{2})/i
-              ];
-              
-              let deliveryMatch = null;
-              for (const pattern of patterns) {
-                deliveryMatch = html.match(pattern);
-                if (deliveryMatch) break;
-              }
-              
-              if (deliveryMatch) {
-                actualDeliveryDate = deliveryMatch[1];
-                currentShippingStatus = 'Delivered';
-              }
-            } else if (lowerHtml.includes('in transit') || lowerHtml.includes('dispatched')) {
-              currentShippingStatus = 'In Transit';
-            } else if (lowerHtml.includes('picked up')) {
-              currentShippingStatus = 'Picked Up';
-            }
-          } catch (e) {
-            console.warn(`Tracking failed for AWB ${trackingNumber}:`, e.message);
-            
-            if (order.fulfillment_status === 'fulfilled') {
-              currentShippingStatus = 'Delivered';
-              if (fulfillment.updated_at) {
-                actualDeliveryDate = new Date(fulfillment.updated_at).toISOString().split('T')[0];
-              }
-            } else {
-              currentShippingStatus = 'Unknown';
-            }
-          }
+       // ========== BLUEDART: USE ESHIPZ TRACKING ==========
+else if (isBluedart && trackingNumber) {
+  try {
+    const trackUrl = `https://track.eshipz.com/track?awb=${trackingNumber}`;
+    const trackRes = await fetch(trackUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    
+    if (!trackRes.ok) {
+      throw new Error(`Eshipz returned ${trackRes.status}`);
+    }
+    
+    const html = await trackRes.text();
+    
+    // ✅ Extract status from StatusBlockTitle
+    const statusBlockMatch = html.match(/<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i);
+    let eshipzStatus = statusBlockMatch ? statusBlockMatch[1].trim() : null;
+    
+    // Fallback: Extract from Remarks field
+    if (!eshipzStatus) {
+      const remarksMatch = html.match(/<h5[^>]*id="Remarks"[^>]*>Status\s*:<strong>\s*([^<]+)<\/strong>/i);
+      eshipzStatus = remarksMatch ? remarksMatch[1].trim() : null;
+    }
+    
+    if (eshipzStatus && eshipzStatus.toLowerCase() === 'delivered') {
+      currentShippingStatus = 'Delivered';
+      
+      // ✅ Extract date from StatusBlock structure
+      const dateMatch = html.match(/<h1[^>]*id="StatusBlockDate"[^>]*>(\d+)<\/h1>/i);
+      const monthMatch = html.match(/<h3[^>]*id="StatusBlockMonth"[^>]*>([^<]+)<\/h3>/i);
+      const yearMatch = html.match(/<h4[^>]*id="StatusBlockYear"[^>]*>(\d+)<\/h4>/i);
+      
+      if (dateMatch && monthMatch && yearMatch) {
+        const day = dateMatch[1].padStart(2, '0');
+        const monthStr = monthMatch[1].trim();
+        const year = yearMatch[1].trim();
+        
+        const monthMap = {
+          'jan': '01', 'january': '01',
+          'feb': '02', 'february': '02',
+          'mar': '03', 'march': '03',
+          'apr': '04', 'april': '04',
+          'may': '05',
+          'jun': '06', 'june': '06',
+          'jul': '07', 'july': '07',
+          'aug': '08', 'august': '08',
+          'sep': '09', 'september': '09',
+          'oct': '10', 'october': '10',
+          'nov': '11', 'november': '11',
+          'dec': '12', 'december': '12'
+        };
+        
+        const month = monthMap[monthStr.toLowerCase()];
+        
+        if (month) {
+          actualDeliveryDate = `${day}/${month}/${year}`;
         }
+      }
+      
+      // Fallback: Extract from shipment history table (first "DELIVERED" row)
+      if (!actualDeliveryDate) {
+        const deliveredRowMatch = html.match(/<tr>\s*<td>(\d{2}\/\d{2}\/\d{4})[^<]*<\/td>\s*<td>[^<]*<\/td>\s*<td[^>]*>SHIPMENT DELIVERED/i);
+        if (deliveredRowMatch) {
+          actualDeliveryDate = deliveredRowMatch[1];
+        }
+      }
+      
+    } else if (eshipzStatus) {
+      const statusLower = eshipzStatus.toLowerCase();
+      
+      if (statusLower.includes('exception')) {
+        currentShippingStatus = 'Exception';
+      } else if (statusLower.includes('out for delivery')) {
+        currentShippingStatus = 'Out for Delivery';
+      } else if (statusLower.includes('in transit')) {
+        currentShippingStatus = 'In Transit';
+      } else if (statusLower.includes('picked')) {
+        currentShippingStatus = 'Picked Up';
+      } else {
+        currentShippingStatus = eshipzStatus;
+      }
+    }
+    
+  } catch (e) {
+    console.warn(`Tracking failed for AWB ${trackingNumber}:`, e.message);
+    
+    // ✅ SIMPLIFIED FALLBACK: Just show status, no date
+    if (order.fulfillment_status === 'fulfilled') {
+      currentShippingStatus = 'Delivered';
+      // Don't set actualDeliveryDate - let it remain null
+      // Frontend can handle null delivery dates gracefully
+    } else {
+      currentShippingStatus = 'Unknown';
+    }
+  }
+}
+
         
         // ========== UNKNOWN CARRIER: FALLBACK ==========
         else {
