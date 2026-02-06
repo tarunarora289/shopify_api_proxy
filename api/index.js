@@ -704,6 +704,13 @@ else if (isBluedart && trackingNumber) {
     }
     
     const html = await trackRes.text();
+
+    // ✅ DEBUG: Log what we got
+    console.log('=== ESHIPZ HTML DEBUG ===');
+    console.log('AWB:', trackingNumber);
+    console.log('HTML Length:', html.length);
+    console.log('Contains StatusBlockTitle:', html.includes('StatusBlockTitle'));
+    console.log('Contains Remarks:', html.includes('id="Remarks"'));
     
     // ✅ Extract status from StatusBlockTitle
     const statusBlockMatch = html.match(/<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i);
