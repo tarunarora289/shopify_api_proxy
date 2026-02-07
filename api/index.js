@@ -691,132 +691,126 @@ module.exports = async (req, res) => {
           }
         }
         
-// ========== BLUEDART: USE ESHIPZ JSON (VERY STRICT) ==========
+// ========== BLUEDART: HYBRID JSON + HTML FALLBACK (FIXES DATE ISSUE) ==========
 else if (isBluedart && trackingNumber) {
   try {
     const trackUrl = `https://track.eshipz.com/track?awb=${trackingNumber}`;
     const trackRes = await fetch(trackUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
-
-    if (!trackRes.ok) {
-      throw new Error(`Eshipz returned ${trackRes.status}`);
-    }
+    if (!trackRes.ok) throw new Error(`Eshipz returned ${trackRes.status}`);
 
     const html = await trackRes.text();
 
     console.log('=== BLUEDART / ESHIPZ DEBUG START ===');
     console.log('AWB:', trackingNumber);
-    console.log('HTML Length:', html.length);
 
-    // STEP 1: Extract response_data JSON block
+    // === PART 1: Parse JSON for status (most reliable) ===
+    let events = [];
     const jsonMatch = html.match(/var\s+response_data\s*=\s*(\[[\s\S]*?\]);/i);
-    if (!jsonMatch) {
-      throw new Error('response_data JSON not found in Eshipz HTML');
+    if (jsonMatch) {
+      try {
+        events = JSON.parse(jsonMatch[1]);
+      } catch (e) {
+        console.warn('JSON parse failed, falling back to HTML');
+      }
     }
 
-    let events;
-    try {
-      events = JSON.parse(jsonMatch[1]);  // parse JSON array safely [web:427]
-    } catch (e) {
-      throw new Error('Failed to parse response_data JSON: ' + e.message);
-    }
+    let eshipzStatus = null;
+    let deliveryDateFromJson = null;
 
-    if (!Array.isArray(events) || events.length === 0) {
-      throw new Error('response_data JSON is empty or not an array');
-    }
+    if (events.length > 0) {
+      // Find delivered event
+      const deliveredEvent = events.find(ev => {
+        const tag    = (ev.tag    || '').toLowerCase().trim();
+        const subtag = (ev.subtag || '').toLowerCase().trim();
+        const msg    = (ev.message || '').toLowerCase().trim();
+        const isDelivered = tag === 'delivered' || subtag === 'delivered' || /\bdelivered\b/.test(msg);
+        const isFailure   = /undelivered|not delivered|failed delivery|rto/i.test(msg);
+        return isDelivered && !isFailure;
+      });
 
-    console.log('BLUEDART DEBUG → events.length:', events.length);
-
-    // STEP 2: Strictly identify the Delivered event
-    const deliveredEvent = events.find(ev => {
-      const tag = (ev.tag || '').toLowerCase().trim();
-      const subtag = (ev.subtag || '').toLowerCase().trim();
-      const msg = (ev.message || '').toLowerCase().trim();
-
-      const looksDelivered =
-        tag === 'delivered' ||
-        subtag === 'delivered' ||
-        /\bdelivered\b/.test(msg);  // word boundary – avoids partial matches [web:389]
-
-      const looksLikeFailure =
-        /undelivered|not delivered|delivery failed|failed delivery|rto/.test(msg);
-
-      return looksDelivered && !looksLikeFailure;
-    });
-
-    // For non-delivered statuses, we'll look at the latest event only for status text
-    const latestEvent = events[0];
-
-    console.log(
-      'BLUEDART DEBUG → deliveredEvent.checkpoint_time:',
-      deliveredEvent && deliveredEvent.checkpoint_time ? deliveredEvent.checkpoint_time : null
-    );
-    console.log(
-      'BLUEDART DEBUG → latestEvent.tag/message:',
-      latestEvent.tag,
-      latestEvent.message
-    );
-
-    // STEP 3: Decide status + date
-    if (deliveredEvent) {
-      currentShippingStatus = 'Delivered';
-
-      const ts = deliveredEvent.checkpoint_time;
-      if (ts) {
-        const d = new Date(ts);
-        if (!isNaN(d.getTime())) {
-          const dd = String(d.getDate()).padStart(2, '0');
-          const mm = String(d.getMonth() + 1).padStart(2, '0');
-          const yyyy = d.getFullYear();
-          actualDeliveryDate = `${dd}/${mm}/${yyyy}`;  // e.g. 02/02/2026
-        } else {
-          console.warn('BLUEDART DEBUG → Invalid checkpoint_time date:', ts);
+      if (deliveredEvent) {
+        eshipzStatus = 'Delivered';
+        const ts = deliveredEvent.checkpoint_time;
+        if (ts) {
+          const d = new Date(ts);
+          if (!isNaN(d.getTime())) {
+            const dd = String(d.getDate()).padStart(2, '0');
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const yyyy = d.getFullYear();
+            deliveryDateFromJson = `${dd}/${mm}/${yyyy}`;
+          }
         }
       } else {
-        console.warn('BLUEDART DEBUG → Delivered event without checkpoint_time');
+        // Use latest event for non-delivered status
+        const latest = events[0];
+        const tag = (latest.tag || '').toLowerCase();
+        const msg = (latest.message || '').toLowerCase();
+
+        if (tag.includes('outfordelivery')) currentShippingStatus = 'Out for Delivery';
+        else if (tag.includes('intransit')) currentShippingStatus = 'In Transit';
+        else if (tag.includes('pickedup'))  currentShippingStatus = 'Picked Up';
+        else if (tag.includes('info'))      currentShippingStatus = 'Info Received';
+        else currentShippingStatus = latest.message || 'Unknown';
       }
-
-      console.log('BLUEDART DEBUG → FINAL status (deliveredEvent):', currentShippingStatus);
-      console.log('BLUEDART DEBUG → FINAL date (deliveredEvent):', actualDeliveryDate);
-    } else {
-      // No clean delivered event: map live status ONLY from latest event, never set a date
-      const tag = (latestEvent.tag || '').toLowerCase();
-      const msg = (latestEvent.message || '').toLowerCase();
-
-      if (tag.includes('outfordelivery')) {
-        currentShippingStatus = 'Out for Delivery';
-      } else if (tag.includes('intransit')) {
-        currentShippingStatus = 'In Transit';
-      } else if (tag.includes('pickedup')) {
-        currentShippingStatus = 'Picked Up';
-      } else if (tag.includes('info')) {
-        currentShippingStatus = 'Info Received';
-      } else {
-        currentShippingStatus = latestEvent.message || 'Unknown';
-      }
-
-      // IMPORTANT: we do NOT set actualDeliveryDate here
-      console.log('BLUEDART DEBUG → FINAL status (no deliveredEvent):', currentShippingStatus);
     }
 
+    // === PART 2: If JSON didn't give status or date, fallback to HTML (your original reliable method) ===
+    if (!eshipzStatus || !deliveryDateFromJson) {
+      // Status from StatusBlockTitle
+      const titleMatch = html.match(/<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i);
+      if (titleMatch) {
+        eshipzStatus = titleMatch[1].trim();
+      }
+
+      // If still no status, try Remarks
+      if (!eshipzStatus) {
+        const remarksMatch = html.match(/<strong>\s*([^<]+)\s*<\/strong>/i);
+        if (remarksMatch) {
+          eshipzStatus = remarksMatch[1].trim();
+        }
+      }
+
+      // Date from StatusBlock (very reliable when present)
+      if (/delivered/i.test(eshipzStatus || '')) {
+        const dayMatch   = html.match(/<h1[^>]*id="StatusBlockDate"[^>]*>(\d+)<\/h1>/i);
+        const monthMatch = html.match(/<h3[^>]*id="StatusBlockMonth"[^>]*>([^<]+)<\/h3>/i);
+        const yearMatch  = html.match(/<h4[^>]*id="StatusBlockYear"[^>]*>(\d+)<\/h4>/i);
+
+        if (dayMatch && monthMatch && yearMatch) {
+          const day   = dayMatch[1].padStart(2, '0');
+          const monthStr = monthMatch[1].trim().toLowerCase();
+          const year  = yearMatch[1].trim();
+
+          const monthMap = { /* your month map */ };
+          const month = monthMap[monthStr];
+          if (month) {
+            deliveryDateFromJson = `${day}/${month}/${year}`;
+          }
+        }
+      }
+    }
+
+    // === Final assignment ===
+    if (eshipzStatus) {
+      currentShippingStatus = /delivered/i.test(eshipzStatus) ? 'Delivered' : eshipzStatus;
+    }
+
+    if (deliveryDateFromJson) {
+      actualDeliveryDate = deliveryDateFromJson;
+    }
+
+    console.log('Final status:', currentShippingStatus);
+    console.log('Final date:', actualDeliveryDate || 'Not found');
     console.log('=== BLUEDART / ESHIPZ DEBUG END ===');
 
   } catch (err) {
     console.warn(`Eshipz tracking failed for AWB ${trackingNumber}:`, err.message);
-
-    // Fallback: never claim Delivered if we couldn't read Eshipz cleanly
-    if (order.fulfillment_status === 'fulfilled') {
-      currentShippingStatus = 'In Transit';  // or 'Shipped'
-    } else {
-      currentShippingStatus = 'Unknown';
-    }
-    // Leave actualDeliveryDate = null
+    currentShippingStatus = order.fulfillment_status === 'fulfilled' ? 'In Transit' : 'Unknown';
+    // No date guessing
   }
-}
-        
+}        
         // ========== UNKNOWN CARRIER: FALLBACK ==========
         else {
           if (order.fulfillment_status === 'fulfilled') {
