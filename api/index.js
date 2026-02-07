@@ -691,137 +691,6 @@ module.exports = async (req, res) => {
           }
         }
         
- // ========== BLUEDART: ROBUST ESHIPZ TRACKING (NO RANDOM DATE) ==========
-else if (isBluedart && trackingNumber) {
-  try {
-    const trackUrl = `https://track.eshipz.com/track?awb=${trackingNumber}`;
-    const trackRes = await fetch(trackUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-
-    if (!trackRes.ok) {
-      throw new Error(`Eshipz returned ${trackRes.status}`);
-    }
-
-    const html = await trackRes.text();
-
-    let eshipzStatus = null;
-    let deliveryDate = null;
-
-    // === STEP 1: Get status from the MOST reliable place (Status Block Title) ===
-    const titleMatch = html.match(
-      /<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i
-    );
-    if (titleMatch) {
-      eshipzStatus = titleMatch[1].trim();
-    }
-console.log('BLUEDART DEBUG → FINAL currentShippingStatus:', currentShippingStatus);
-console.log('BLUEDART DEBUG → FINAL actualDeliveryDate:', actualDeliveryDate);
-
-    // === STEP 2: If not found, try Remarks (scoped to the Remarks block) ===
-    if (!eshipzStatus) {
-      const remarksMatch = html.match(
-        /<h5[^>]*id="Remarks"[^>]*>.*?Status\s*:<strong>\s*([^<]+)\s*<\/strong>/i
-      );
-      if (remarksMatch) {
-        eshipzStatus = remarksMatch[1].trim();
-      }
-    }
-
-    // === STEP 3: Only set Delivered if we have strong confirmation ===
-    if (eshipzStatus && /delivered/i.test(eshipzStatus)) {
-      currentShippingStatus = 'Delivered';
-
-      // === HIGHEST PRIORITY DATE: Status Block header ===
-      const dayMatch = html.match(
-        /<h1[^>]*id="StatusBlockDate"[^>]*>(\d+)<\/h1>/i
-      );
-      const monthMatch = html.match(
-        /<h3[^>]*id="StatusBlockMonth"[^>]*>([^<]+)<\/h3>/i
-      );
-      const yearMatch = html.match(
-        /<h4[^>]*id="StatusBlockYear"[^>]*>(\d{4})<\/h4>/i
-      );
-
-      if (dayMatch && monthMatch && yearMatch) {
-        const day = dayMatch[1].padStart(2, '0');
-        const monthStr = monthMatch[1].trim().toLowerCase();
-        const year = yearMatch[1].trim();
-
-        const monthMap = {
-          jan: '01', january: '01',
-          feb: '02', february: '02',
-          mar: '03', march: '03',
-          apr: '04', april: '04',
-          may: '05',
-          jun: '06', june: '06',
-          jul: '07', july: '07',
-          aug: '08', august: '08',
-          sep: '09', september: '09',
-          oct: '10', october: '10',
-          nov: '11', november: '11',
-          dec: '12', december: '12'
-        };
-
-        const month = monthMap[monthStr];
-        if (month) {
-          // DD/MM/YYYY
-          deliveryDate = `${day}/${month}/${year}`;
-        }
-      }
-
-      // === STRONG FALLBACK ONLY: first history row with a delivered-like status ===
-      if (!deliveryDate) {
-        const deliveredRowMatch = html.match(
-          /<tr>\s*<td>(\d{2}\/\d{2}\/\d{4})[^<]*<\/td>\s*<td[^>]*>[^<]*<\/td>\s*<td[^>]*>(?:SHIPMENT DELIVERED|DELIVERED|Delivered Successfully)[^<]*<\/td>/i
-        );
-        if (deliveredRowMatch) {
-          deliveryDate = deliveredRowMatch[1]; // already DD/MM/YYYY
-        }
-      }
-    }
-
-    // === Final status normalization ===
-    // Only override if we *haven't* already set it to Delivered above
-    if (eshipzStatus && currentShippingStatus !== 'Delivered') {
-      const lower = eshipzStatus.toLowerCase().trim();
-
-      if (/delivered/.test(lower)) {
-        currentShippingStatus = 'Delivered';
-      } else if (/exception|failed|undelivered/.test(lower)) {
-        currentShippingStatus = 'Exception';
-      } else if (/out for delivery/.test(lower)) {
-        currentShippingStatus = 'Out for Delivery';
-      } else if (/in transit/.test(lower)) {
-        currentShippingStatus = 'In Transit';
-      } else if (/picked|pickup/.test(lower)) {
-        currentShippingStatus = 'Picked Up';
-      } else {
-        currentShippingStatus = eshipzStatus; // raw status text as fallback
-      }
-    }
-
-    // If we got a delivery date from Eshipz, use it
-    if (deliveryDate) {
-      actualDeliveryDate = deliveryDate;
-    }
-
-  } catch (err) {
-    console.warn(`Eshipz tracking failed for AWB ${trackingNumber}:`, err.message);
-
-    // Fallback updated as discussed:
-    // Do NOT auto-mark delivered just because Shopify says fulfilled.
-    // Fulfilled in Shopify only means shipped, not guaranteed delivered. [web:399][web:402]
-    if (order.fulfillment_status === 'fulfilled') {
-      currentShippingStatus = 'In Transit'; // or 'Shipped', your choice
-    } else {
-      currentShippingStatus = 'Unknown';
-    }
-    // Leave actualDeliveryDate = null here – better no date than a guessed one
-  }
-}
 // ========== BLUEDART: ROBUST ESHIPZ TRACKING (NO RANDOM DATE) ==========
 else if (isBluedart && trackingNumber) {
   try {
@@ -838,10 +707,17 @@ else if (isBluedart && trackingNumber) {
 
     const html = await trackRes.text();
 
+    // DEBUG: basic info
+    console.log('=== BLUEDART / ESHIPZ DEBUG START ===');
+    console.log('AWB:', trackingNumber);
+    console.log('HTML Length:', html.length);
+    console.log('Contains StatusBlockTitle:', html.includes('StatusBlockTitle'));
+    console.log('Contains Remarks:', html.includes('id="Remarks"'));
+
     let eshipzStatus = null;
     let deliveryDate = null;
 
-    // === STEP 1: Get status from the MOST reliable place (Status Block Title) ===
+    // STEP 1: Try StatusBlockTitle first
     const titleMatch = html.match(
       /<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i
     );
@@ -849,25 +725,23 @@ else if (isBluedart && trackingNumber) {
       eshipzStatus = titleMatch[1].trim();
     }
 
-    // === STEP 2: If not found, try Remarks (scoped to the Remarks block) ===
+    // STEP 2: If not found, try Remarks (robust, tailored to your HTML)
     if (!eshipzStatus) {
       const remarksMatch = html.match(
-        /<h5[^>]*id="Remarks"[^>]*>.*?Status\s*:<strong>\s*([^<]+)\s*<\/strong>/i
+        /<h5[^>]*id="Remarks"[^>]*>[^<]*<strong>\s*([^<]+)\s*<\/strong>/i
       );
       if (remarksMatch) {
         eshipzStatus = remarksMatch[1].trim();
       }
     }
-console.log('BLUEDART DEBUG → AWB:', trackingNumber);
-console.log('BLUEDART DEBUG → eshipzStatus:', eshipzStatus);
-console.log('BLUEDART DEBUG → currentShippingStatus BEFORE normalization:', currentShippingStatus);
-console.log('BLUEDART DEBUG → deliveryDate BEFORE assignment:', deliveryDate);
 
-    // === STEP 3: Only set Delivered if we have strong confirmation ===
+    console.log('BLUEDART DEBUG → eshipzStatus:', eshipzStatus);
+
+    // STEP 3: Only set Delivered if we have strong confirmation
     if (eshipzStatus && /delivered/i.test(eshipzStatus)) {
       currentShippingStatus = 'Delivered';
 
-      // === HIGHEST PRIORITY DATE: Status Block header ===
+      // Highest priority date: Status Block header
       const dayMatch = html.match(
         /<h1[^>]*id="StatusBlockDate"[^>]*>(\d+)<\/h1>/i
       );
@@ -905,7 +779,7 @@ console.log('BLUEDART DEBUG → deliveryDate BEFORE assignment:', deliveryDate);
         }
       }
 
-      // === STRONG FALLBACK ONLY: first history row with a delivered-like status ===
+      // Strong fallback: first history row with a delivered-like status
       if (!deliveryDate) {
         const deliveredRowMatch = html.match(
           /<tr>\s*<td>(\d{2}\/\d{2}\/\d{4})[^<]*<\/td>\s*<td[^>]*>[^<]*<\/td>\s*<td[^>]*>(?:SHIPMENT DELIVERED|DELIVERED|Delivered Successfully)[^<]*<\/td>/i
@@ -916,8 +790,7 @@ console.log('BLUEDART DEBUG → deliveryDate BEFORE assignment:', deliveryDate);
       }
     }
 
-    // === Final status normalization ===
-    // Only override if we *haven't* already set it to Delivered above
+    // Final status normalization (only if not already set to Delivered above)
     if (eshipzStatus && currentShippingStatus !== 'Delivered') {
       const lower = eshipzStatus.toLowerCase().trim();
 
@@ -932,7 +805,7 @@ console.log('BLUEDART DEBUG → deliveryDate BEFORE assignment:', deliveryDate);
       } else if (/picked|pickup/.test(lower)) {
         currentShippingStatus = 'Picked Up';
       } else {
-        currentShippingStatus = eshipzStatus; // raw status text as fallback
+        currentShippingStatus = eshipzStatus; // raw text as last resort
       }
     }
 
@@ -941,18 +814,21 @@ console.log('BLUEDART DEBUG → deliveryDate BEFORE assignment:', deliveryDate);
       actualDeliveryDate = deliveryDate;
     }
 
+    console.log('BLUEDART DEBUG → FINAL currentShippingStatus:', currentShippingStatus);
+    console.log('BLUEDART DEBUG → FINAL actualDeliveryDate:', actualDeliveryDate);
+    console.log('=== BLUEDART / ESHIPZ DEBUG END ===');
+
   } catch (err) {
     console.warn(`Eshipz tracking failed for AWB ${trackingNumber}:`, err.message);
 
-    // Fallback updated as discussed:
-    // Do NOT auto-mark delivered just because Shopify says fulfilled.
-    // Fulfilled in Shopify only means shipped, not guaranteed delivered. [web:399][web:402]
+    // Fallback: do NOT auto-mark Delivered just because Shopify says fulfilled
+    // Fulfilled = shipped, not guaranteed delivered. [web:399][web:402]
     if (order.fulfillment_status === 'fulfilled') {
-      currentShippingStatus = 'In Transit'; // or 'Shipped', your choice
+      currentShippingStatus = 'In Transit'; // or 'Shipped', as you prefer
     } else {
       currentShippingStatus = 'Unknown';
     }
-    // Leave actualDeliveryDate = null here – better no date than a guessed one
+    // Leave actualDeliveryDate = null – better no date than a guessed one
   }
 }
         
