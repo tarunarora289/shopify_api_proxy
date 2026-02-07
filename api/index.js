@@ -717,6 +717,8 @@ else if (isBluedart && trackingNumber) {
     if (titleMatch) {
       eshipzStatus = titleMatch[1].trim();
     }
+console.log('BLUEDART DEBUG → FINAL currentShippingStatus:', currentShippingStatus);
+console.log('BLUEDART DEBUG → FINAL actualDeliveryDate:', actualDeliveryDate);
 
     // === STEP 2: If not found, try Remarks (scoped to the Remarks block) ===
     if (!eshipzStatus) {
@@ -856,6 +858,10 @@ else if (isBluedart && trackingNumber) {
         eshipzStatus = remarksMatch[1].trim();
       }
     }
+console.log('BLUEDART DEBUG → AWB:', trackingNumber);
+console.log('BLUEDART DEBUG → eshipzStatus:', eshipzStatus);
+console.log('BLUEDART DEBUG → currentShippingStatus BEFORE normalization:', currentShippingStatus);
+console.log('BLUEDART DEBUG → deliveryDate BEFORE assignment:', deliveryDate);
 
     // === STEP 3: Only set Delivered if we have strong confirmation ===
     if (eshipzStatus && /delivered/i.test(eshipzStatus)) {
