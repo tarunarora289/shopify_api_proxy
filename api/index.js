@@ -705,7 +705,7 @@ else if (isBluedart && trackingNumber) {
     console.log('=== BLUEDART / ESHIPZ DEBUG START ===');
     console.log('AWB:', trackingNumber);
 
-    // === PART 1: Parse JSON for status (most reliable) ===
+    // === PART 1: Parse JSON for status/date (most reliable) ===
     let events = [];
     const jsonMatch = html.match(/var\s+response_data\s*=\s*(\[[\s\S]*?\]);/i);
     if (jsonMatch) {
@@ -717,17 +717,24 @@ else if (isBluedart && trackingNumber) {
     }
 
     let eshipzStatus = null;
-    let deliveryDateFromJson = null;
+    let deliveryDateFromJson = null; // will be ISO: YYYY-MM-DD
 
     if (events.length > 0) {
-      // Find delivered event
+      // Strict delivered event
       const deliveredEvent = events.find(ev => {
         const tag    = (ev.tag    || '').toLowerCase().trim();
         const subtag = (ev.subtag || '').toLowerCase().trim();
         const msg    = (ev.message || '').toLowerCase().trim();
-        const isDelivered = tag === 'delivered' || subtag === 'delivered' || /\bdelivered\b/.test(msg);
-        const isFailure   = /undelivered|not delivered|failed delivery|rto/i.test(msg);
-        return isDelivered && !isFailure;
+
+        const looksDelivered =
+          tag === 'delivered' ||
+          subtag === 'delivered' ||
+          /\bdelivered\b/.test(msg);
+
+        const looksFailure =
+          /undelivered|not delivered|delivery failed|failed delivery|rto/.test(msg);
+
+        return looksDelivered && !looksFailure;
       });
 
       if (deliveredEvent) {
@@ -736,27 +743,25 @@ else if (isBluedart && trackingNumber) {
         if (ts) {
           const d = new Date(ts);
           if (!isNaN(d.getTime())) {
-            const dd = String(d.getDate()).padStart(2, '0');
-            const mm = String(d.getMonth() + 1).padStart(2, '0');
-            const yyyy = d.getFullYear();
-            deliveryDateFromJson = `${dd}/${mm}/${yyyy}`;
+            // Store ISO for safe parsing on frontend: 2026-02-02
+            deliveryDateFromJson = d.toISOString().split('T')[0]; // [web:441][web:389]
           }
         }
       } else {
-        // Use latest event for non-delivered status
+        // No delivered event: map latest event to a live status (no date)
         const latest = events[0];
         const tag = (latest.tag || '').toLowerCase();
         const msg = (latest.message || '').toLowerCase();
 
-        if (tag.includes('outfordelivery')) currentShippingStatus = 'Out for Delivery';
-        else if (tag.includes('intransit')) currentShippingStatus = 'In Transit';
-        else if (tag.includes('pickedup'))  currentShippingStatus = 'Picked Up';
-        else if (tag.includes('info'))      currentShippingStatus = 'Info Received';
-        else currentShippingStatus = latest.message || 'Unknown';
+        if (tag.includes('outfordelivery'))      currentShippingStatus = 'Out for Delivery';
+        else if (tag.includes('intransit'))      currentShippingStatus = 'In Transit';
+        else if (tag.includes('pickedup'))       currentShippingStatus = 'Picked Up';
+        else if (tag.includes('info'))           currentShippingStatus = 'Info Received';
+        else                                     currentShippingStatus = latest.message || 'Unknown';
       }
     }
 
-    // === PART 2: If JSON didn't give status or date, fallback to HTML (your original reliable method) ===
+    // === PART 2: If JSON didn't give status or date, fallback to HTML ===
     if (!eshipzStatus || !deliveryDateFromJson) {
       // Status from StatusBlockTitle
       const titleMatch = html.match(/<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i);
@@ -764,29 +769,59 @@ else if (isBluedart && trackingNumber) {
         eshipzStatus = titleMatch[1].trim();
       }
 
-      // If still no status, try Remarks
+      // If still no status, try Remarks: <h5 id="Remarks">Status :<strong> Delivered</strong></h5>
       if (!eshipzStatus) {
-        const remarksMatch = html.match(/<strong>\s*([^<]+)\s*<\/strong>/i);
+        const remarksMatch = html.match(
+          /<h5[^>]*id="Remarks"[^>]*>[^<]*<strong>\s*([^<]+)\s*<\/strong>/i
+        );
         if (remarksMatch) {
           eshipzStatus = remarksMatch[1].trim();
         }
       }
 
-      // Date from StatusBlock (very reliable when present)
+      // Date from StatusBlock for Delivered
       if (/delivered/i.test(eshipzStatus || '')) {
         const dayMatch   = html.match(/<h1[^>]*id="StatusBlockDate"[^>]*>(\d+)<\/h1>/i);
         const monthMatch = html.match(/<h3[^>]*id="StatusBlockMonth"[^>]*>([^<]+)<\/h3>/i);
         const yearMatch  = html.match(/<h4[^>]*id="StatusBlockYear"[^>]*>(\d+)<\/h4>/i);
 
         if (dayMatch && monthMatch && yearMatch) {
-          const day   = dayMatch[1].padStart(2, '0');
+          const day      = dayMatch[1].padStart(2, '0');
           const monthStr = monthMatch[1].trim().toLowerCase();
-          const year  = yearMatch[1].trim();
+          const year     = yearMatch[1].trim();
 
-          const monthMap = { /* your month map */ };
+          const monthMap = {
+            jan: '01', january: '01',
+            feb: '02', february: '02',
+            mar: '03', march: '03',
+            apr: '04', april: '04',
+            may: '05',
+            jun: '06', june: '06',
+            jul: '07', july: '07',
+            aug: '08', august: '08',
+            sep: '09', september: '09',
+            oct: '10', october: '10',
+            nov: '11', november: '11',
+            dec: '12', december: '12'
+          };
+
           const month = monthMap[monthStr];
           if (month) {
-            deliveryDateFromJson = `${day}/${month}/${year}`;
+            // Build ISO: YYYY-MM-DD (frontend will format as dd/mm/yyyy) [web:441][web:442]
+            deliveryDateFromJson = `${year}-${month}-${day}`;
+          }
+        }
+
+        // Optional extra fallback: first DD/MM/YYYY near "DELIVERED" row in table
+        if (!deliveryDateFromJson) {
+          const deliveredRowMatch = html.match(
+            /(\d{2}\/\d{2}\/\d{4})[^<]{0,120}(SHIPMENT DELIVERED|DELIVERED|Delivered Successfully)/i
+          );
+          if (deliveredRowMatch) {
+            const [dd, mm, yyyy] = deliveredRowMatch[1].split('/');
+            if (dd && mm && yyyy) {
+              deliveryDateFromJson = `${yyyy}-${mm}-${dd}`;
+            }
           }
         }
       }
@@ -794,23 +829,36 @@ else if (isBluedart && trackingNumber) {
 
     // === Final assignment ===
     if (eshipzStatus) {
-      currentShippingStatus = /delivered/i.test(eshipzStatus) ? 'Delivered' : eshipzStatus;
+      if (/delivered/i.test(eshipzStatus)) {
+        currentShippingStatus = 'Delivered';
+      } else if (/exception|failed|undelivered/i.test(eshipzStatus.toLowerCase())) {
+        currentShippingStatus = 'Exception';
+      } else if (/out for delivery/i.test(eshipzStatus.toLowerCase())) {
+        currentShippingStatus = 'Out for Delivery';
+      } else if (/in transit/i.test(eshipzStatus.toLowerCase())) {
+        currentShippingStatus = 'In Transit';
+      } else if (/picked|pickup/i.test(eshipzStatus.toLowerCase())) {
+        currentShippingStatus = 'Picked Up';
+      } else {
+        currentShippingStatus = eshipzStatus;
+      }
     }
 
     if (deliveryDateFromJson) {
-      actualDeliveryDate = deliveryDateFromJson;
+      actualDeliveryDate = deliveryDateFromJson; // ISO string, e.g. "2026-02-02"
     }
 
     console.log('Final status:', currentShippingStatus);
-    console.log('Final date:', actualDeliveryDate || 'Not found');
+    console.log('Final date (ISO):', actualDeliveryDate || 'Not found');
     console.log('=== BLUEDART / ESHIPZ DEBUG END ===');
 
   } catch (err) {
     console.warn(`Eshipz tracking failed for AWB ${trackingNumber}:`, err.message);
+    // Fallback: never claim Delivered on failure
     currentShippingStatus = order.fulfillment_status === 'fulfilled' ? 'In Transit' : 'Unknown';
-    // No date guessing
+    // Do NOT guess date
   }
-}        
+}
         // ========== UNKNOWN CARRIER: FALLBACK ==========
         else {
           if (order.fulfillment_status === 'fulfilled') {
