@@ -691,7 +691,7 @@ module.exports = async (req, res) => {
           }
         }
         
-// ========== BLUEDART: ROBUST ESHIPZ TRACKING (NO RANDOM DATE) ==========
+// ========== BLUEDART: USE ESHIPZ JSON (VERY STRICT) ==========
 else if (isBluedart && trackingNumber) {
   try {
     const trackUrl = `https://track.eshipz.com/track?awb=${trackingNumber}`;
@@ -707,128 +707,113 @@ else if (isBluedart && trackingNumber) {
 
     const html = await trackRes.text();
 
-    // DEBUG: basic info
     console.log('=== BLUEDART / ESHIPZ DEBUG START ===');
     console.log('AWB:', trackingNumber);
     console.log('HTML Length:', html.length);
-    console.log('Contains StatusBlockTitle:', html.includes('StatusBlockTitle'));
-    console.log('Contains Remarks:', html.includes('id="Remarks"'));
 
-    let eshipzStatus = null;
-    let deliveryDate = null;
+    // STEP 1: Extract response_data JSON block
+    const jsonMatch = html.match(/var\s+response_data\s*=\s*(\[[\s\S]*?\]);/i);
+    if (!jsonMatch) {
+      throw new Error('response_data JSON not found in Eshipz HTML');
+    }
 
-    // STEP 1: Try StatusBlockTitle first
-    const titleMatch = html.match(
-      /<h4[^>]*id="StatusBlockTitle"[^>]*>([^<]+)<\/h4>/i
+    let events;
+    try {
+      events = JSON.parse(jsonMatch[1]);  // parse JSON array safely [web:427]
+    } catch (e) {
+      throw new Error('Failed to parse response_data JSON: ' + e.message);
+    }
+
+    if (!Array.isArray(events) || events.length === 0) {
+      throw new Error('response_data JSON is empty or not an array');
+    }
+
+    console.log('BLUEDART DEBUG → events.length:', events.length);
+
+    // STEP 2: Strictly identify the Delivered event
+    const deliveredEvent = events.find(ev => {
+      const tag = (ev.tag || '').toLowerCase().trim();
+      const subtag = (ev.subtag || '').toLowerCase().trim();
+      const msg = (ev.message || '').toLowerCase().trim();
+
+      const looksDelivered =
+        tag === 'delivered' ||
+        subtag === 'delivered' ||
+        /\bdelivered\b/.test(msg);  // word boundary – avoids partial matches [web:389]
+
+      const looksLikeFailure =
+        /undelivered|not delivered|delivery failed|failed delivery|rto/.test(msg);
+
+      return looksDelivered && !looksLikeFailure;
+    });
+
+    // For non-delivered statuses, we'll look at the latest event only for status text
+    const latestEvent = events[0];
+
+    console.log(
+      'BLUEDART DEBUG → deliveredEvent.checkpoint_time:',
+      deliveredEvent && deliveredEvent.checkpoint_time ? deliveredEvent.checkpoint_time : null
     );
-    if (titleMatch) {
-      eshipzStatus = titleMatch[1].trim();
-    }
+    console.log(
+      'BLUEDART DEBUG → latestEvent.tag/message:',
+      latestEvent.tag,
+      latestEvent.message
+    );
 
-    // STEP 2: If not found, try Remarks (robust, tailored to your HTML)
-    if (!eshipzStatus) {
-      const remarksMatch = html.match(
-        /<h5[^>]*id="Remarks"[^>]*>[^<]*<strong>\s*([^<]+)\s*<\/strong>/i
-      );
-      if (remarksMatch) {
-        eshipzStatus = remarksMatch[1].trim();
-      }
-    }
-
-    console.log('BLUEDART DEBUG → eshipzStatus:', eshipzStatus);
-
-    // STEP 3: Only set Delivered if we have strong confirmation
-    if (eshipzStatus && /delivered/i.test(eshipzStatus)) {
+    // STEP 3: Decide status + date
+    if (deliveredEvent) {
       currentShippingStatus = 'Delivered';
 
-      // Highest priority date: Status Block header
-      const dayMatch = html.match(
-        /<h1[^>]*id="StatusBlockDate"[^>]*>(\d+)<\/h1>/i
-      );
-      const monthMatch = html.match(
-        /<h3[^>]*id="StatusBlockMonth"[^>]*>([^<]+)<\/h3>/i
-      );
-      const yearMatch = html.match(
-        /<h4[^>]*id="StatusBlockYear"[^>]*>(\d{4})<\/h4>/i
-      );
-
-      if (dayMatch && monthMatch && yearMatch) {
-        const day = dayMatch[1].padStart(2, '0');
-        const monthStr = monthMatch[1].trim().toLowerCase();
-        const year = yearMatch[1].trim();
-
-        const monthMap = {
-          jan: '01', january: '01',
-          feb: '02', february: '02',
-          mar: '03', march: '03',
-          apr: '04', april: '04',
-          may: '05',
-          jun: '06', june: '06',
-          jul: '07', july: '07',
-          aug: '08', august: '08',
-          sep: '09', september: '09',
-          oct: '10', october: '10',
-          nov: '11', november: '11',
-          dec: '12', december: '12'
-        };
-
-        const month = monthMap[monthStr];
-        if (month) {
-          // DD/MM/YYYY
-          deliveryDate = `${day}/${month}/${year}`;
+      const ts = deliveredEvent.checkpoint_time;
+      if (ts) {
+        const d = new Date(ts);
+        if (!isNaN(d.getTime())) {
+          const dd = String(d.getDate()).padStart(2, '0');
+          const mm = String(d.getMonth() + 1).padStart(2, '0');
+          const yyyy = d.getFullYear();
+          actualDeliveryDate = `${dd}/${mm}/${yyyy}`;  // e.g. 02/02/2026
+        } else {
+          console.warn('BLUEDART DEBUG → Invalid checkpoint_time date:', ts);
         }
-      }
-
-      // Strong fallback: first history row with a delivered-like status
-      if (!deliveryDate) {
-        const deliveredRowMatch = html.match(
-          /<tr>\s*<td>(\d{2}\/\d{2}\/\d{4})[^<]*<\/td>\s*<td[^>]*>[^<]*<\/td>\s*<td[^>]*>(?:SHIPMENT DELIVERED|DELIVERED|Delivered Successfully)[^<]*<\/td>/i
-        );
-        if (deliveredRowMatch) {
-          deliveryDate = deliveredRowMatch[1]; // already DD/MM/YYYY
-        }
-      }
-    }
-
-    // Final status normalization (only if not already set to Delivered above)
-    if (eshipzStatus && currentShippingStatus !== 'Delivered') {
-      const lower = eshipzStatus.toLowerCase().trim();
-
-      if (/delivered/.test(lower)) {
-        currentShippingStatus = 'Delivered';
-      } else if (/exception|failed|undelivered/.test(lower)) {
-        currentShippingStatus = 'Exception';
-      } else if (/out for delivery/.test(lower)) {
-        currentShippingStatus = 'Out for Delivery';
-      } else if (/in transit/.test(lower)) {
-        currentShippingStatus = 'In Transit';
-      } else if (/picked|pickup/.test(lower)) {
-        currentShippingStatus = 'Picked Up';
       } else {
-        currentShippingStatus = eshipzStatus; // raw text as last resort
+        console.warn('BLUEDART DEBUG → Delivered event without checkpoint_time');
       }
+
+      console.log('BLUEDART DEBUG → FINAL status (deliveredEvent):', currentShippingStatus);
+      console.log('BLUEDART DEBUG → FINAL date (deliveredEvent):', actualDeliveryDate);
+    } else {
+      // No clean delivered event: map live status ONLY from latest event, never set a date
+      const tag = (latestEvent.tag || '').toLowerCase();
+      const msg = (latestEvent.message || '').toLowerCase();
+
+      if (tag.includes('outfordelivery')) {
+        currentShippingStatus = 'Out for Delivery';
+      } else if (tag.includes('intransit')) {
+        currentShippingStatus = 'In Transit';
+      } else if (tag.includes('pickedup')) {
+        currentShippingStatus = 'Picked Up';
+      } else if (tag.includes('info')) {
+        currentShippingStatus = 'Info Received';
+      } else {
+        currentShippingStatus = latestEvent.message || 'Unknown';
+      }
+
+      // IMPORTANT: we do NOT set actualDeliveryDate here
+      console.log('BLUEDART DEBUG → FINAL status (no deliveredEvent):', currentShippingStatus);
     }
 
-    // If we got a delivery date from Eshipz, use it
-    if (deliveryDate) {
-      actualDeliveryDate = deliveryDate;
-    }
-
-    console.log('BLUEDART DEBUG → FINAL currentShippingStatus:', currentShippingStatus);
-    console.log('BLUEDART DEBUG → FINAL actualDeliveryDate:', actualDeliveryDate);
     console.log('=== BLUEDART / ESHIPZ DEBUG END ===');
 
   } catch (err) {
     console.warn(`Eshipz tracking failed for AWB ${trackingNumber}:`, err.message);
 
-    // Fallback: do NOT auto-mark Delivered just because Shopify says fulfilled
-    // Fulfilled = shipped, not guaranteed delivered. [web:399][web:402]
+    // Fallback: never claim Delivered if we couldn't read Eshipz cleanly
     if (order.fulfillment_status === 'fulfilled') {
-      currentShippingStatus = 'In Transit'; // or 'Shipped', as you prefer
+      currentShippingStatus = 'In Transit';  // or 'Shipped'
     } else {
       currentShippingStatus = 'Unknown';
     }
-    // Leave actualDeliveryDate = null – better no date than a guessed one
+    // Leave actualDeliveryDate = null
   }
 }
         
