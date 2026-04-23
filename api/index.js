@@ -985,7 +985,9 @@ else if (isBluedart && trackingNumber) {
       order: adminOrder,
       selected_line_items: adminSelectedLineItems,
       original_order_id: adminOriginalOrderId,
-      admin_override: adminOverride
+      admin_override: adminOverride,
+      admin_portal: adminPortal,
+      fee_waived: feeWaived
     } = req.body || {};
 
     // ---------- ADMIN RETURN ----------
@@ -1050,7 +1052,6 @@ else if (isBluedart && trackingNumber) {
         console.log('Admin Override:', adminOverride);
 
         // ✅ GUARD 1: No returnable fulfillments
-        // Admin can override this with adminOverride: true + confirmation on frontend
         if (adminReturnableFulfillments.length === 0) {
           if (!adminOverride) {
             return res.status(400).json({
@@ -1061,15 +1062,17 @@ else if (isBluedart && trackingNumber) {
             });
           }
 
-          // Admin has confirmed override → tag order manually, skip Shopify return mutation
           console.warn('⚠️ ADMIN OVERRIDE: No returnable fulfillments. Tagging order manually.');
+
+          let manualReturnTags = 'admin-manual-return,return-requested,portal-created,admin-override';
+          if (adminPortal) manualReturnTags += ',admin-portal';
 
           await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOrderId}.json`, {
             method: 'PUT',
             headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               order: {
-                tags: 'admin-manual-return,return-requested,portal-created,admin-override',
+                tags: manualReturnTags,
                 note: `ADMIN MANUAL RETURN OVERRIDE → Items: ${adminReturnItems.map(i => i.line_item_id).join(', ')} | Reason: ${adminReturnItems[0]?.reason || 'N/A'} | Override: Order had no returnable fulfillments`
               }
             })
@@ -1084,7 +1087,7 @@ else if (isBluedart && trackingNumber) {
           });
         }
 
-        // ✅ Build line item mapping (same logic as customer return)
+        // ✅ Build line item mapping
         const adminLineItemToFulfillmentMap = {};
 
         adminReturnableFulfillments.forEach(edge => {
@@ -1132,7 +1135,6 @@ else if (isBluedart && trackingNumber) {
         }
 
         // ✅ GUARD 2: No valid items mapped
-        // Admin can override this with adminOverride: true
         if (adminReturnLineItems.length === 0) {
           if (!adminOverride) {
             return res.status(400).json({
@@ -1144,15 +1146,17 @@ else if (isBluedart && trackingNumber) {
             });
           }
 
-          // Admin has confirmed override → tag order manually
           console.warn('⚠️ ADMIN OVERRIDE: No valid line items mapped. Tagging order manually.');
+
+          let manualItemsTags = 'admin-manual-return,return-requested,portal-created,admin-override';
+          if (adminPortal) manualItemsTags += ',admin-portal';
 
           await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOrderId}.json`, {
             method: 'PUT',
             headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               order: {
-                tags: 'admin-manual-return,return-requested,portal-created,admin-override',
+                tags: manualItemsTags,
                 note: `ADMIN MANUAL RETURN OVERRIDE → Items could not be mapped to fulfillments. Requested items: ${adminReturnItems.map(i => i.line_item_id).join(', ')} | Reason: ${adminReturnItems[0]?.reason || 'N/A'}`
               }
             })
@@ -1168,7 +1172,7 @@ else if (isBluedart && trackingNumber) {
           });
         }
 
-        // ✅ STEP: Create return via Shopify returnRequest mutation (same as customer)
+        // ✅ Create return via Shopify returnRequest mutation
         const adminReturnRequestMutation = `
           mutation returnRequest($input: ReturnRequestInput!) {
             returnRequest(input: $input) {
@@ -1239,12 +1243,15 @@ else if (isBluedart && trackingNumber) {
 
         // Tag original order
         try {
+          let returnSuccessTags = 'return-requested,portal-created,admin-created';
+          if (adminPortal) returnSuccessTags += ',admin-portal';
+
           await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOrderId}.json`, {
             method: 'PUT',
             headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               order: {
-                tags: 'return-requested,portal-created,admin-created',
+                tags: returnSuccessTags,
                 note: `ADMIN RETURN → Return: ${adminCreatedReturn.name}`
               }
             })
@@ -1278,10 +1285,10 @@ else if (isBluedart && trackingNumber) {
       try {
         console.log('=== ADMIN EXCHANGE REQUEST RECEIVED ===');
         console.log('Number of items:', adminSelectedLineItems.length);
+        console.log('Fee Waived:', feeWaived);
 
         const adminOriginalOrderName = adminOrder.name || 'Unknown Order';
 
-        // ✅ Count previous exchanges (same logic as customer — fees stay identical)
         const adminCustomerOrdersRes = await fetch(
           `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${adminCustomerId}&status=any&limit=250&fields=tags`,
           { headers: { 'X-Shopify-Access-Token': token } }
@@ -1375,47 +1382,52 @@ else if (isBluedart && trackingNumber) {
           }
         }
 
-        // ✅ Exchange fee — same logic as customer, unchanged
+        // ✅ Exchange fee
         if (!adminIsFirstExchange) {
           adminTotalExchangeFees += 200;
         }
 
-        if (adminTotalCustomFees > 0) {
-          adminDraftLineItems.push({
-            title: `Custom Size Fee (${adminTotalCustomFees / 200} item${adminTotalCustomFees > 200 ? 's' : ''})`,
-            price: adminTotalCustomFees.toFixed(2),
-            quantity: 1,
-            taxable: false,
-            custom: true
-          });
+        // ✅ FEE WAIVER: skip all fee line items if admin waived
+        if (!feeWaived) {
+          if (adminTotalCustomFees > 0) {
+            adminDraftLineItems.push({
+              title: `Custom Size Fee (${adminTotalCustomFees / 200} item${adminTotalCustomFees > 200 ? 's' : ''})`,
+              price: adminTotalCustomFees.toFixed(2),
+              quantity: 1,
+              taxable: false,
+              custom: true
+            });
+          }
+
+          if (adminTotalExchangeFees > 0) {
+            adminDraftLineItems.push({
+              title: 'Exchange Processing Fee',
+              price: adminTotalExchangeFees.toFixed(2),
+              quantity: 1,
+              taxable: false,
+              custom: true
+            });
+          }
+
+          if (adminTotalPriceDifference !== 0) {
+            adminDraftLineItems.push({
+              title: adminTotalPriceDifference > 0 ? 'Price Difference' : 'Price Adjustment (Store Credit)',
+              price: adminTotalPriceDifference.toFixed(2),
+              quantity: 1,
+              taxable: false,
+              custom: true
+            });
+          }
         }
 
-        if (adminTotalExchangeFees > 0) {
-          adminDraftLineItems.push({
-            title: 'Exchange Processing Fee',
-            price: adminTotalExchangeFees.toFixed(2),
-            quantity: 1,
-            taxable: false,
-            custom: true
-          });
-        }
+        // ✅ Total: zero if fee waived
+        const adminTotalAmountDue = feeWaived ? 0 : (adminTotalPriceDifference + adminTotalCustomFees + adminTotalExchangeFees);
 
-        if (adminTotalPriceDifference !== 0) {
-          adminDraftLineItems.push({
-            title: adminTotalPriceDifference > 0 ? 'Price Difference' : 'Price Adjustment (Store Credit)',
-            price: adminTotalPriceDifference.toFixed(2),
-            quantity: 1,
-            taxable: false,
-            custom: true
-          });
-        }
-
-        const adminTotalAmountDue = adminTotalPriceDifference + adminTotalCustomFees + adminTotalExchangeFees;
-
+        // ✅ Tags
         let adminDraftTags = 'exchange-draft,portal-created,exchange-portal,exchange-requested,admin-created';
-        if (adminHasCustomSize) {
-          adminDraftTags += ',custom-size-exchange';
-        }
+        if (adminHasCustomSize) adminDraftTags += ',custom-size-exchange';
+        if (adminPortal) adminDraftTags += ',admin-portal';
+        if (feeWaived) adminDraftTags += ',admin-fee-waived';
 
         const adminItemSummary = adminSelectedLineItems.map((item, idx) => {
           const type = item.is_custom_size ? 'Custom Size' : 'Size Change';
@@ -1423,6 +1435,7 @@ else if (isBluedart && trackingNumber) {
         }).join(' | ');
 
         let adminOrderNote = `ADMIN EXCHANGE for Order ${adminOriginalOrderName} | ${adminItemSummary} | Total Items: ${adminSelectedLineItems.length}`;
+        if (feeWaived) adminOrderNote += ' | FEES WAIVED BY ADMIN';
 
         const adminCustomSizeDetails = adminSelectedLineItems
           .filter(item => item.is_custom_size && item.custom_measurements)
@@ -1472,12 +1485,16 @@ else if (isBluedart && trackingNumber) {
         // Tag original order
         if (adminOriginalOrderId) {
           try {
+            let originalOrderTags = 'exchange-in-progress,portal-exchange,admin-created';
+            if (adminPortal) originalOrderTags += ',admin-portal';
+            if (feeWaived) originalOrderTags += ',admin-fee-waived';
+
             await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOriginalOrderId}.json`, {
               method: 'PUT',
               headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 order: {
-                  tags: 'exchange-in-progress,portal-exchange,admin-created',
+                  tags: originalOrderTags,
                   note: `ADMIN EXCHANGE REQUESTED → Draft Order: ${adminDraftOrderName}`
                 }
               })
@@ -1487,7 +1504,7 @@ else if (isBluedart && trackingNumber) {
           }
         }
 
-        // ✅ Same logic as customer: complete if no payment, else send invoice
+        // ✅ Complete if no payment, else send invoice
         if (adminTotalAmountDue <= 0) {
           const adminCompleteRes = await fetch(
             `https://${storeDomain}/admin/api/2024-07/draft_orders/${adminDraftId}/complete.json`,
@@ -1508,12 +1525,16 @@ else if (isBluedart && trackingNumber) {
 
           if (adminOriginalOrderId) {
             try {
+              let completedTags = 'exchange-processed,portal-exchange,admin-created';
+              if (adminPortal) completedTags += ',admin-portal';
+              if (feeWaived) completedTags += ',admin-fee-waived';
+
               await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOriginalOrderId}.json`, {
                 method: 'PUT',
                 headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   order: {
-                    tags: 'exchange-processed,portal-exchange,admin-created',
+                    tags: completedTags,
                     note: `ADMIN EXCHANGED → New Order: ${adminCompletedOrderName}`
                   }
                 })
@@ -1629,7 +1650,7 @@ else if (isBluedart && trackingNumber) {
           adminCustomerId = adminFetchedOrder.customer.id;
         }
 
-        // ✅ Exchange count (same as customer)
+        // ✅ Exchange count
         if (adminCustomerId) {
           try {
             const adminExchangeCountRes = await fetch(
@@ -1649,7 +1670,7 @@ else if (isBluedart && trackingNumber) {
           adminData.exchange_count = 0;
         }
 
-        // ✅ Shipping status (same carrier detection as customer)
+        // ✅ Shipping status
         const adminFulfillment = adminFetchedOrder.fulfillments?.[0];
         let adminActualDeliveryDate = null;
         let adminCurrentShippingStatus = 'Processing';
@@ -1733,7 +1754,7 @@ else if (isBluedart && trackingNumber) {
           max: adminMaxDelivery.toISOString().split('T')[0]
         };
 
-        // ✅ Fetch product images + variants (same as customer)
+        // ✅ Fetch product images + variants
         for (let item of adminFetchedOrder.line_items) {
           if (item.product_id) {
             const adminProductRes = await fetch(
@@ -1763,7 +1784,7 @@ else if (isBluedart && trackingNumber) {
           }
         }
 
-        // ✅ already_processed: flag it but DO NOT block — admin sees warning banner
+        // ✅ already_processed check — warns but does NOT block admin
         const adminTags = (adminFetchedOrder.tags || '').toLowerCase();
         const adminNote = (adminFetchedOrder.note || '').toLowerCase();
 
@@ -1807,6 +1828,3 @@ else if (isBluedart && trackingNumber) {
       }
     }
   }
-  // ==================== END ADMIN SECTION ====================
-  res.status(400).json({ error: 'Invalid request' });
-};
