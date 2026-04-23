@@ -144,7 +144,7 @@ module.exports = async (req, res) => {
       if (returnLineItems.length === 0) {
         return res.status(400).json({
           error: 'Cannot create return',
-          message: 'No eligible items found for return. Please contact support at truewest.info@gmail.com',
+          message: 'No eligible items found for return. Please contact support at truewest.care@gmail.com',
           code: 'NO_VALID_ITEMS',
           failed_items: failedItems
         });
