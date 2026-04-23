@@ -965,6 +965,848 @@ else if (isBluedart && trackingNumber) {
     }
     return;
   }
+  // ==================== ADMIN: AUTH CHECK ====================
+  // All admin routes require x-admin-token header matching ADMIN_SECRET_TOKEN env var
+  const adminToken = req.headers['x-admin-token'];
+  const isAdmin = adminToken && adminToken === process.env.ADMIN_SECRET_TOKEN;
 
+  // If token is present but wrong → reject immediately
+  if (adminToken && !isAdmin) {
+    return res.status(401).json({ error: 'Unauthorized', code: 'INVALID_ADMIN_TOKEN' });
+  }
+
+  // ==================== ADMIN POST: SUBMIT RETURN (with override) ====================
+  if (req.method === 'POST' && isAdmin) {
+    const {
+      action: adminAction,
+      order_id: adminOrderId,
+      return_items: adminReturnItems,
+      customer_id: adminCustomerId,
+      order: adminOrder,
+      selected_line_items: adminSelectedLineItems,
+      original_order_id: adminOriginalOrderId,
+      admin_override: adminOverride
+    } = req.body || {};
+
+    // ---------- ADMIN RETURN ----------
+    if (adminAction === 'admin_submit_return' && adminOrderId && adminReturnItems) {
+      try {
+        const returnableQuery = `
+          query returnableFulfillmentsQuery($orderId: ID!) {
+            returnableFulfillments(orderId: $orderId, first: 10) {
+              edges {
+                node {
+                  id
+                  fulfillment {
+                    id
+                  }
+                  returnableFulfillmentLineItems(first: 50) {
+                    edges {
+                      node {
+                        fulfillmentLineItem {
+                          id
+                          lineItem {
+                            id
+                          }
+                        }
+                        quantity
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `;
+
+        const adminReturnableRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': token,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            query: returnableQuery,
+            variables: { orderId: `gid://shopify/Order/${adminOrderId}` }
+          })
+        });
+
+        if (!adminReturnableRes.ok) {
+          const errorText = await adminReturnableRes.text();
+          throw new Error(`GraphQL request failed (${adminReturnableRes.status}): ${errorText}`);
+        }
+
+        const adminReturnableData = await adminReturnableRes.json();
+
+        if (adminReturnableData.errors) {
+          throw new Error(`GraphQL errors: ${JSON.stringify(adminReturnableData.errors)}`);
+        }
+
+        const adminReturnableFulfillments = adminReturnableData.data?.returnableFulfillments?.edges || [];
+
+        console.log('=== ADMIN RETURN REQUEST DEBUG ===');
+        console.log('Admin Order ID:', adminOrderId);
+        console.log('Returnable Fulfillments Found:', adminReturnableFulfillments.length);
+        console.log('Admin Override:', adminOverride);
+
+        // ✅ GUARD 1: No returnable fulfillments
+        // Admin can override this with adminOverride: true + confirmation on frontend
+        if (adminReturnableFulfillments.length === 0) {
+          if (!adminOverride) {
+            return res.status(400).json({
+              error: 'Order not eligible for return',
+              message: 'Order has no returnable fulfillments. Check admin_override to proceed manually.',
+              code: 'NO_RETURNABLE_FULFILLMENTS',
+              requires_override: true
+            });
+          }
+
+          // Admin has confirmed override → tag order manually, skip Shopify return mutation
+          console.warn('⚠️ ADMIN OVERRIDE: No returnable fulfillments. Tagging order manually.');
+
+          await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOrderId}.json`, {
+            method: 'PUT',
+            headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              order: {
+                tags: 'admin-manual-return,return-requested,portal-created,admin-override',
+                note: `ADMIN MANUAL RETURN OVERRIDE → Items: ${adminReturnItems.map(i => i.line_item_id).join(', ')} | Reason: ${adminReturnItems[0]?.reason || 'N/A'} | Override: Order had no returnable fulfillments`
+              }
+            })
+          });
+
+          return res.json({
+            success: true,
+            admin_override: true,
+            warning: 'Order had no returnable fulfillments. It has been tagged for manual return processing.',
+            manual: true,
+            order_id: adminOrderId
+          });
+        }
+
+        // ✅ Build line item mapping (same logic as customer return)
+        const adminLineItemToFulfillmentMap = {};
+
+        adminReturnableFulfillments.forEach(edge => {
+          const returnableItems = edge.node.returnableFulfillmentLineItems.edges || [];
+          returnableItems.forEach(item => {
+            const fliId = item.node.fulfillmentLineItem.id;
+            const liId = item.node.fulfillmentLineItem.lineItem.id;
+            const cleanLiId = liId.split('/').pop();
+            adminLineItemToFulfillmentMap[cleanLiId] = fliId;
+          });
+        });
+
+        console.log('Admin Line Item Mapping:', adminLineItemToFulfillmentMap);
+
+        // ✅ Build return line items
+        const adminReturnLineItems = [];
+        const adminFailedItems = [];
+
+        for (const returnItem of adminReturnItems) {
+          const lineItemId = String(returnItem.line_item_id);
+          const fulfillmentLineItemId = adminLineItemToFulfillmentMap[lineItemId];
+
+          if (!fulfillmentLineItemId) {
+            console.warn(`Admin: No returnable fulfillment found for line item ${lineItemId}`);
+            adminFailedItems.push({
+              line_item_id: lineItemId,
+              reason: 'Item not found in fulfillment records'
+            });
+            continue;
+          }
+
+          const reasonMap = {
+            'size': 'SIZE_TOO_SMALL',
+            'defective': 'DEFECTIVE',
+            'quality': 'NOT_AS_DESCRIBED',
+            'other': 'OTHER'
+          };
+
+          adminReturnLineItems.push({
+            fulfillmentLineItemId: fulfillmentLineItemId,
+            quantity: returnItem.quantity || 1,
+            returnReason: reasonMap[returnItem.reason] || 'OTHER',
+            customerNote: returnItem.comment || `Admin return: ${returnItem.reason}`
+          });
+        }
+
+        // ✅ GUARD 2: No valid items mapped
+        // Admin can override this with adminOverride: true
+        if (adminReturnLineItems.length === 0) {
+          if (!adminOverride) {
+            return res.status(400).json({
+              error: 'No eligible items found',
+              message: 'No line items could be mapped to fulfillment records. Check admin_override to tag manually.',
+              code: 'NO_VALID_ITEMS',
+              requires_override: true,
+              failed_items: adminFailedItems
+            });
+          }
+
+          // Admin has confirmed override → tag order manually
+          console.warn('⚠️ ADMIN OVERRIDE: No valid line items mapped. Tagging order manually.');
+
+          await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOrderId}.json`, {
+            method: 'PUT',
+            headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              order: {
+                tags: 'admin-manual-return,return-requested,portal-created,admin-override',
+                note: `ADMIN MANUAL RETURN OVERRIDE → Items could not be mapped to fulfillments. Requested items: ${adminReturnItems.map(i => i.line_item_id).join(', ')} | Reason: ${adminReturnItems[0]?.reason || 'N/A'}`
+              }
+            })
+          });
+
+          return res.json({
+            success: true,
+            admin_override: true,
+            warning: 'Items could not be mapped to fulfillment records. Order has been tagged for manual return processing.',
+            manual: true,
+            failed_items: adminFailedItems,
+            order_id: adminOrderId
+          });
+        }
+
+        // ✅ STEP: Create return via Shopify returnRequest mutation (same as customer)
+        const adminReturnRequestMutation = `
+          mutation returnRequest($input: ReturnRequestInput!) {
+            returnRequest(input: $input) {
+              userErrors {
+                field
+                message
+              }
+              return {
+                id
+                name
+                status
+                returnLineItems(first: 50) {
+                  edges {
+                    node {
+                      id
+                      returnReason
+                      customerNote
+                      quantity
+                    }
+                  }
+                }
+                order {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        `;
+
+        const adminReturnRes = await fetch(`https://${storeDomain}/admin/api/2024-07/graphql.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': token,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            query: adminReturnRequestMutation,
+            variables: {
+              input: {
+                orderId: `gid://shopify/Order/${adminOrderId}`,
+                returnLineItems: adminReturnLineItems
+              }
+            }
+          })
+        });
+
+        if (!adminReturnRes.ok) {
+          const errorText = await adminReturnRes.text();
+          throw new Error(`Return request failed (${adminReturnRes.status}): ${errorText}`);
+        }
+
+        const adminReturnData = await adminReturnRes.json();
+
+        if (adminReturnData.errors) {
+          throw new Error(`GraphQL errors: ${JSON.stringify(adminReturnData.errors)}`);
+        }
+
+        const adminReturnRequest = adminReturnData.data.returnRequest;
+
+        if (adminReturnRequest.userErrors && adminReturnRequest.userErrors.length > 0) {
+          const errorMessages = adminReturnRequest.userErrors.map(e => e.message).join(', ');
+          throw new Error(`Return creation failed: ${errorMessages}`);
+        }
+
+        const adminCreatedReturn = adminReturnRequest.return;
+        console.log('✅ Admin return created successfully:', adminCreatedReturn.name);
+
+        // Tag original order
+        try {
+          await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOrderId}.json`, {
+            method: 'PUT',
+            headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              order: {
+                tags: 'return-requested,portal-created,admin-created',
+                note: `ADMIN RETURN → Return: ${adminCreatedReturn.name}`
+              }
+            })
+          });
+        } catch (tagErr) {
+          console.warn('Warning: Could not tag order:', tagErr.message);
+        }
+
+        return res.json({
+          success: true,
+          message: 'Admin return request created successfully!',
+          return_id: adminCreatedReturn.id,
+          return_name: adminCreatedReturn.name,
+          status: adminCreatedReturn.status,
+          order_name: adminCreatedReturn.order.name,
+          admin_created: true
+        });
+
+      } catch (err) {
+        console.error('❌ Admin return error:', err.message);
+        return res.status(500).json({
+          error: 'Admin return failed: ' + err.message,
+          code: 'ADMIN_RETURN_ERROR',
+          details: err.toString()
+        });
+      }
+    }
+
+    // ---------- ADMIN EXCHANGE ----------
+    if (adminAction === 'admin_submit_exchange' && adminOrder && adminCustomerId && adminSelectedLineItems) {
+      try {
+        console.log('=== ADMIN EXCHANGE REQUEST RECEIVED ===');
+        console.log('Number of items:', adminSelectedLineItems.length);
+
+        const adminOriginalOrderName = adminOrder.name || 'Unknown Order';
+
+        // ✅ Count previous exchanges (same logic as customer — fees stay identical)
+        const adminCustomerOrdersRes = await fetch(
+          `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${adminCustomerId}&status=any&limit=250&fields=tags`,
+          { headers: { 'X-Shopify-Access-Token': token } }
+        );
+        const adminCustomerOrders = (await adminCustomerOrdersRes.json()).orders || [];
+        const adminPreviousExchanges = adminCustomerOrders.filter(o =>
+          (o.tags || '').toLowerCase().includes('exchange-processed')
+        ).length;
+        const adminIsFirstExchange = adminPreviousExchanges === 0;
+
+        let adminTotalPriceDifference = 0;
+        let adminTotalCustomFees = 0;
+        let adminTotalExchangeFees = 0;
+        const adminDraftLineItems = [];
+        let adminHasCustomSize = false;
+
+        for (const selected of adminSelectedLineItems) {
+          const originalPrice = parseFloat(selected.price || 0);
+          let newPrice = originalPrice;
+          let variantTitle = 'N/A';
+          let productId = selected.product_id;
+          let productTitle = selected.title || 'Custom Item';
+
+          const isCustom = selected.is_custom_size === true;
+          let variantId = selected.original_variant_id;
+
+          if (isCustom) {
+            adminHasCustomSize = true;
+            variantId = selected.original_variant_id;
+            variantTitle = 'Custom Size';
+          } else if (selected.variant_id) {
+            variantId = selected.variant_id;
+
+            const variantRes = await fetch(
+              `https://${storeDomain}/admin/api/2024-07/variants/${selected.variant_id}.json`,
+              { headers: { 'X-Shopify-Access-Token': token } }
+            );
+            if (variantRes.ok) {
+              const variantData = await variantRes.json();
+              newPrice = parseFloat(variantData.variant.price || originalPrice);
+              variantTitle = variantData.variant.title || 'N/A';
+            }
+          }
+
+          if (productId) {
+            const productRes = await fetch(
+              `https://${storeDomain}/admin/api/2024-07/products/${productId}.json`,
+              { headers: { 'X-Shopify-Access-Token': token } }
+            );
+            if (productRes.ok) {
+              const prodData = await productRes.json();
+              productTitle = prodData.product.title;
+            }
+          }
+
+          let adminCustomProperties = [];
+          if (isCustom && selected.custom_measurements) {
+            const m = selected.custom_measurements;
+            adminCustomProperties = [
+              { name: 'Exchange Type', value: 'Custom Size (Admin Created)' },
+              { name: 'Original Size', value: selected.current_size || 'N/A' },
+              { name: 'Bust', value: `${m.bust || '-'} inches` },
+              { name: 'Waist', value: `${m.waist || '-'} inches` },
+              { name: 'Hips', value: `${m.hips || '-'} inches` },
+              { name: 'Shoulder', value: `${m.shoulder || '-'} inches` },
+              { name: 'Length', value: `${m.length || '-'} inches` }
+            ];
+          } else {
+            adminCustomProperties = [
+              { name: 'Exchange Type', value: 'Size Change (Admin Created)' },
+              { name: 'Original Size', value: selected.current_size || 'N/A' },
+              { name: 'New Size', value: variantTitle }
+            ];
+          }
+
+          adminDraftLineItems.push({
+            product_id: productId,
+            variant_id: variantId,
+            quantity: 1,
+            price: '0.00',
+            title: isCustom ? `${productTitle} - Custom Size` : productTitle,
+            properties: adminCustomProperties,
+            taxable: true,
+            requires_shipping: true
+          });
+
+          adminTotalPriceDifference += (newPrice - originalPrice);
+
+          if (isCustom) {
+            adminTotalCustomFees += 200;
+          }
+        }
+
+        // ✅ Exchange fee — same logic as customer, unchanged
+        if (!adminIsFirstExchange) {
+          adminTotalExchangeFees += 200;
+        }
+
+        if (adminTotalCustomFees > 0) {
+          adminDraftLineItems.push({
+            title: `Custom Size Fee (${adminTotalCustomFees / 200} item${adminTotalCustomFees > 200 ? 's' : ''})`,
+            price: adminTotalCustomFees.toFixed(2),
+            quantity: 1,
+            taxable: false,
+            custom: true
+          });
+        }
+
+        if (adminTotalExchangeFees > 0) {
+          adminDraftLineItems.push({
+            title: 'Exchange Processing Fee',
+            price: adminTotalExchangeFees.toFixed(2),
+            quantity: 1,
+            taxable: false,
+            custom: true
+          });
+        }
+
+        if (adminTotalPriceDifference !== 0) {
+          adminDraftLineItems.push({
+            title: adminTotalPriceDifference > 0 ? 'Price Difference' : 'Price Adjustment (Store Credit)',
+            price: adminTotalPriceDifference.toFixed(2),
+            quantity: 1,
+            taxable: false,
+            custom: true
+          });
+        }
+
+        const adminTotalAmountDue = adminTotalPriceDifference + adminTotalCustomFees + adminTotalExchangeFees;
+
+        let adminDraftTags = 'exchange-draft,portal-created,exchange-portal,exchange-requested,admin-created';
+        if (adminHasCustomSize) {
+          adminDraftTags += ',custom-size-exchange';
+        }
+
+        const adminItemSummary = adminSelectedLineItems.map((item, idx) => {
+          const type = item.is_custom_size ? 'Custom Size' : 'Size Change';
+          return `Item ${idx + 1}: ${item.title} (${type})`;
+        }).join(' | ');
+
+        let adminOrderNote = `ADMIN EXCHANGE for Order ${adminOriginalOrderName} | ${adminItemSummary} | Total Items: ${adminSelectedLineItems.length}`;
+
+        const adminCustomSizeDetails = adminSelectedLineItems
+          .filter(item => item.is_custom_size && item.custom_measurements)
+          .map((item, idx) => {
+            const m = item.custom_measurements;
+            return `\n\nCUSTOM SIZE ${idx + 1}: ${item.title}\nBust: ${m.bust || 'N/A'}" | Waist: ${m.waist || 'N/A'}" | Hips: ${m.hips || 'N/A'}" | Shoulder: ${m.shoulder || 'N/A'}" | Length: ${m.length || 'N/A'}"`;
+          })
+          .join('');
+
+        if (adminCustomSizeDetails) {
+          adminOrderNote += adminCustomSizeDetails;
+        }
+
+        const adminDraftPayload = {
+          draft_order: {
+            line_items: adminDraftLineItems,
+            customer: { id: adminCustomerId },
+            email: adminOrder.email,
+            shipping_address: adminOrder.shipping_address,
+            billing_address: adminOrder.billing_address || adminOrder.shipping_address,
+            note: adminOrderNote,
+            tags: adminDraftTags,
+            requires_shipping: true
+          }
+        };
+
+        const adminDraftRes = await fetch(`https://${storeDomain}/admin/api/2024-07/draft_orders.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': token,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(adminDraftPayload)
+        });
+
+        if (!adminDraftRes.ok) {
+          const errorText = await adminDraftRes.text();
+          throw new Error('Admin draft creation failed: ' + errorText);
+        }
+
+        const adminDraftData = await adminDraftRes.json();
+        const adminDraftId = adminDraftData.draft_order.id;
+        const adminDraftOrderName = adminDraftData.draft_order.name;
+
+        console.log('✅ Admin draft order created:', adminDraftOrderName);
+
+        // Tag original order
+        if (adminOriginalOrderId) {
+          try {
+            await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOriginalOrderId}.json`, {
+              method: 'PUT',
+              headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                order: {
+                  tags: 'exchange-in-progress,portal-exchange,admin-created',
+                  note: `ADMIN EXCHANGE REQUESTED → Draft Order: ${adminDraftOrderName}`
+                }
+              })
+            });
+          } catch (tagErr) {
+            console.warn('Warning: Could not tag original order:', tagErr.message);
+          }
+        }
+
+        // ✅ Same logic as customer: complete if no payment, else send invoice
+        if (adminTotalAmountDue <= 0) {
+          const adminCompleteRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/draft_orders/${adminDraftId}/complete.json`,
+            {
+              method: 'PUT',
+              headers: { 'X-Shopify-Access-Token': token }
+            }
+          );
+
+          if (!adminCompleteRes.ok) {
+            const errorText = await adminCompleteRes.text();
+            throw new Error('Admin draft completion failed: ' + errorText);
+          }
+
+          const adminCompleteData = await adminCompleteRes.json();
+          const adminCompletedOrder = adminCompleteData.draft_order;
+          const adminCompletedOrderName = adminCompletedOrder.name || `#${adminCompletedOrder.order_id}`;
+
+          if (adminOriginalOrderId) {
+            try {
+              await fetch(`https://${storeDomain}/admin/api/2024-07/orders/${adminOriginalOrderId}.json`, {
+                method: 'PUT',
+                headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  order: {
+                    tags: 'exchange-processed,portal-exchange,admin-created',
+                    note: `ADMIN EXCHANGED → New Order: ${adminCompletedOrderName}`
+                  }
+                })
+              });
+            } catch (updateErr) {
+              console.warn('Warning: Could not update original order:', updateErr.message);
+            }
+          }
+
+          return res.json({
+            success: true,
+            exchange_order: adminCompletedOrder,
+            message: 'Admin exchange order created successfully! No payment required.',
+            amount_due: 0,
+            admin_created: true
+          });
+
+        } else {
+          try {
+            await fetch(
+              `https://${storeDomain}/admin/api/2024-07/draft_orders/${adminDraftId}/send_invoice.json`,
+              {
+                method: 'POST',
+                headers: {
+                  'X-Shopify-Access-Token': token,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  draft_order_invoice: {
+                    to: adminOrder.email,
+                    from: 'trueweststore@gmail.com',
+                    subject: `Payment Required for Exchange - Order ${adminOriginalOrderName}`,
+                    custom_message: `Hi! To complete your exchange, please pay ₹${adminTotalAmountDue.toFixed(2)}. Click the button below to complete payment.`
+                  }
+                })
+              }
+            );
+          } catch (invoiceErr) {
+            console.warn('Warning: Could not send invoice email:', invoiceErr.message);
+          }
+
+          return res.json({
+            success: true,
+            payment_url: adminDraftData.draft_order.invoice_url,
+            draft_id: adminDraftId,
+            draft_order_name: adminDraftOrderName,
+            amount_due: adminTotalAmountDue.toFixed(2),
+            breakdown: {
+              price_difference: adminTotalPriceDifference.toFixed(2),
+              custom_size_fees: adminTotalCustomFees.toFixed(2),
+              exchange_fees: adminTotalExchangeFees.toFixed(2)
+            },
+            message: 'Admin exchange: Payment required. Invoice sent to customer.',
+            admin_created: true
+          });
+        }
+
+      } catch (err) {
+        console.error('❌ Admin exchange error:', err.message);
+        return res.status(500).json({
+          error: 'Admin exchange failed: ' + err.message,
+          code: 'ADMIN_EXCHANGE_ERROR',
+          details: err.toString()
+        });
+      }
+    }
+
+    // ---------- ADMIN GET ORDER ----------
+    if (req.method === 'GET' && isAdmin) {
+      const { query: adminQuery, contact: adminContact } = req.query || {};
+      if (!adminQuery) return res.status(400).json({ error: 'Missing query parameter' });
+
+      let adminData;
+      let adminCustomerId = null;
+
+      try {
+        if (adminContact) {
+          const contactField = adminContact.includes('@') ? 'email' : 'phone';
+          const adminCustomerRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/customers/search.json?query=${contactField}:${encodeURIComponent(adminContact)}`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          if (!adminCustomerRes.ok) throw new Error(await adminCustomerRes.text());
+          const adminCustomerData = await adminCustomerRes.json();
+          if (adminCustomerData.customers.length === 0) return res.status(404).json({ error: 'Customer not found' });
+          adminCustomerId = adminCustomerData.customers[0].id;
+
+          const adminOrdersRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&customer_id=${adminCustomerId}&name=#${adminQuery}&limit=1`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          if (!adminOrdersRes.ok) throw new Error(await adminOrdersRes.text());
+          adminData = await adminOrdersRes.json();
+        } else {
+          const adminOrderRes = await fetch(
+            `https://${storeDomain}/admin/api/2024-07/orders.json?status=any&name=#${adminQuery}&limit=1`,
+            { headers: { 'X-Shopify-Access-Token': token } }
+          );
+          if (!adminOrderRes.ok) throw new Error(await adminOrderRes.text());
+          adminData = await adminOrderRes.json();
+        }
+
+        if (!adminData.orders || adminData.orders.length === 0) {
+          return res.status(404).json({ error: 'Order not found' });
+        }
+
+        const adminCleanQuery = adminQuery.replace('#', '');
+        const adminExactOrder = adminData.orders.find(o => o.name === `#${adminCleanQuery}` || String(o.order_number) === adminCleanQuery);
+        const adminFetchedOrder = adminExactOrder || adminData.orders[0];
+        adminData.orders = [adminFetchedOrder];
+
+        if (!adminCustomerId && adminFetchedOrder.customer) {
+          adminCustomerId = adminFetchedOrder.customer.id;
+        }
+
+        // ✅ Exchange count (same as customer)
+        if (adminCustomerId) {
+          try {
+            const adminExchangeCountRes = await fetch(
+              `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${adminCustomerId}&status=any&limit=250&fields=tags`,
+              { headers: { 'X-Shopify-Access-Token': token } }
+            );
+            if (adminExchangeCountRes.ok) {
+              const adminAllOrders = (await adminExchangeCountRes.json()).orders || [];
+              adminData.exchange_count = adminAllOrders.filter(o =>
+                (o.tags || '').toLowerCase().includes('exchange-processed')
+              ).length;
+            }
+          } catch (e) {
+            adminData.exchange_count = 0;
+          }
+        } else {
+          adminData.exchange_count = 0;
+        }
+
+        // ✅ Shipping status (same carrier detection as customer)
+        const adminFulfillment = adminFetchedOrder.fulfillments?.[0];
+        let adminActualDeliveryDate = null;
+        let adminCurrentShippingStatus = 'Processing';
+
+        if (adminFulfillment) {
+          const adminTrackingCompany = (adminFulfillment.tracking_company || '').toLowerCase();
+          const adminTrackingNumber = adminFulfillment.tracking_number?.trim();
+          const adminShipmentStatus = adminFulfillment.shipment_status;
+
+          const adminIsDelhivery = adminTrackingCompany.includes('delhivery');
+          const adminIsBluedart = adminTrackingCompany.includes('bluedart') || adminTrackingCompany.includes('blue dart');
+
+          if (adminIsDelhivery) {
+            if (adminShipmentStatus === 'delivered' || adminFetchedOrder.fulfillment_status === 'fulfilled') {
+              adminCurrentShippingStatus = 'Delivered';
+              if (adminFulfillment.updated_at) {
+                adminActualDeliveryDate = new Date(adminFulfillment.updated_at).toISOString().split('T')[0];
+              }
+            } else if (adminShipmentStatus === 'in_transit') {
+              adminCurrentShippingStatus = 'In Transit';
+            } else if (adminShipmentStatus === 'out_for_delivery') {
+              adminCurrentShippingStatus = 'Out for Delivery';
+            }
+          } else if (adminIsBluedart && adminTrackingNumber) {
+            try {
+              const adminTrackRes = await fetch(`https://track.eshipz.com/track?awb=${adminTrackingNumber}`, {
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+              });
+              if (adminTrackRes.ok) {
+                const adminHtml = await adminTrackRes.text();
+                let adminEvents = [];
+                const adminJsonMatch = adminHtml.match(/var\s+response_data\s*=\s*(\[[\s\S]*?\]);/i);
+                if (adminJsonMatch) {
+                  try { adminEvents = JSON.parse(adminJsonMatch[1]); } catch (e) {}
+                }
+
+                if (adminEvents.length > 0) {
+                  const adminDeliveredEvent = adminEvents.find(ev => {
+                    const tag = (ev.tag || '').toLowerCase().trim();
+                    const msg = (ev.message || '').toLowerCase().trim();
+                    return (tag === 'delivered' || /\bdelivered\b/.test(msg)) && !/undelivered|not delivered|delivery failed|rto/.test(msg);
+                  });
+
+                  if (adminDeliveredEvent) {
+                    adminCurrentShippingStatus = 'Delivered';
+                    const ts = adminDeliveredEvent.checkpoint_time;
+                    if (ts) {
+                      const d = new Date(ts);
+                      if (!isNaN(d.getTime())) {
+                        adminActualDeliveryDate = d.toISOString().split('T')[0];
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (trackErr) {
+              console.warn('Admin: Eshipz tracking failed:', trackErr.message);
+              adminCurrentShippingStatus = adminFetchedOrder.fulfillment_status === 'fulfilled' ? 'In Transit' : 'Unknown';
+            }
+          } else {
+            if (adminFetchedOrder.fulfillment_status === 'fulfilled') {
+              adminCurrentShippingStatus = 'Delivered';
+              if (adminFulfillment.updated_at) {
+                adminActualDeliveryDate = new Date(adminFulfillment.updated_at).toISOString().split('T')[0];
+              }
+            }
+          }
+        }
+
+        adminFetchedOrder.actual_delivery_date = adminActualDeliveryDate;
+        adminFetchedOrder.delivered_at = adminActualDeliveryDate;
+        adminFetchedOrder.current_shipping_status = adminCurrentShippingStatus;
+
+        const adminCreated = new Date(adminFetchedOrder.created_at);
+        const adminMinDelivery = new Date(adminCreated);
+        adminMinDelivery.setDate(adminCreated.getDate() + 5);
+        const adminMaxDelivery = new Date(adminCreated);
+        adminMaxDelivery.setDate(adminCreated.getDate() + 7);
+        adminFetchedOrder.estimated_delivery = {
+          min: adminMinDelivery.toISOString().split('T')[0],
+          max: adminMaxDelivery.toISOString().split('T')[0]
+        };
+
+        // ✅ Fetch product images + variants (same as customer)
+        for (let item of adminFetchedOrder.line_items) {
+          if (item.product_id) {
+            const adminProductRes = await fetch(
+              `https://${storeDomain}/admin/api/2024-07/products/${item.product_id}.json?fields=id,title,images,variants`,
+              { headers: { 'X-Shopify-Access-Token': token } }
+            );
+            const adminProductData = await adminProductRes.json();
+            const adminProduct = adminProductData.product;
+
+            item.image_url = adminProduct?.images?.[0]?.src || 'https://via.placeholder.com/80';
+            item.available_variants = adminProduct?.variants?.map(v => ({
+              id: v.id,
+              title: v.title,
+              price: v.price,
+              inventory_quantity: v.inventory_quantity,
+              available: v.inventory_quantity > 0
+            })) || [];
+
+            const adminCurrentVariant = adminProduct?.variants?.find(v => v.id === item.variant_id);
+            if (adminCurrentVariant) {
+              item.current_size = adminCurrentVariant.title;
+              item.current_inventory = adminCurrentVariant.inventory_quantity;
+            }
+          } else {
+            item.image_url = 'https://via.placeholder.com/80';
+            item.available_variants = [];
+          }
+        }
+
+        // ✅ already_processed: flag it but DO NOT block — admin sees warning banner
+        const adminTags = (adminFetchedOrder.tags || '').toLowerCase();
+        const adminNote = (adminFetchedOrder.note || '').toLowerCase();
+
+        if (adminTags.includes('exchange-processed') || adminTags.includes('return-processed')) {
+          adminData.already_processed = true;
+          adminData.admin_warning = 'This order has already been processed. You are viewing as admin and can still proceed.';
+
+          if (adminCustomerId) {
+            try {
+              const adminAllRes = await fetch(
+                `https://${storeDomain}/admin/api/2024-07/orders.json?customer_id=${adminCustomerId}&limit=250`,
+                { headers: { 'X-Shopify-Access-Token': token } }
+              );
+              const adminAll = (await adminAllRes.json()).orders || [];
+              const adminReplacement = adminAll.find(o => o.note && o.note.toLowerCase().includes(adminFetchedOrder.name.toLowerCase()));
+              if (adminReplacement) {
+                adminData.exchange_order_name = adminReplacement.name;
+                adminData.related_order = adminReplacement;
+              } else {
+                adminData.exchange_order_name = 'Processed';
+              }
+            } catch (e) {
+              adminData.exchange_order_name = 'Processed';
+            }
+          }
+        } else if (adminNote.includes('exchange for') || adminTags.includes('exchange-order') || adminTags.includes('portal-created')) {
+          adminData.already_processed = true;
+          adminData.admin_warning = 'This order has already been processed. You are viewing as admin and can still proceed.';
+          adminData.exchange_order_name = adminFetchedOrder.name;
+        }
+
+        return res.json(adminData);
+
+      } catch (err) {
+        console.error('Admin proxy error:', err.message);
+        return res.status(500).json({
+          error: err.message,
+          code: 'ADMIN_ORDER_FETCH_ERROR',
+          details: err.toString()
+        });
+      }
+    }
+  }
+  // ==================== END ADMIN SECTION ====================
   res.status(400).json({ error: 'Invalid request' });
 };
