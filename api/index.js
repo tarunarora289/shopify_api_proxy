@@ -366,7 +366,10 @@ module.exports = async (req, res) => {
           ];
           console.log('ℹ️ Regular size change properties:', customProperties);
         }
-
+customProperties.push({ name: "Reason", value: selected.reason || "Size issue" });
+customProperties.push({ name: "Other Reason", value: selected.reasonRemarks || "" });
+customProperties.push({ name: "Reason Remarks", value: selected.reasonRemarks || "" });
+customProperties.push({ name: "Exchange Remarks", value: selected.reasonRemarks || "" });
         draftLineItems.push({
           product_id: productId,
           variant_id: variantId,
