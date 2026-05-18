@@ -385,7 +385,7 @@ customProperties.push({ name: "Exchange Remarks", value: selected.reasonRemarks 
         totalPriceDifference += priceDiff;
 
         if (isCustom) {
-          totalCustomFees += 200;
+          totalCustomFees += 250;
         }
       }
 
@@ -395,7 +395,7 @@ customProperties.push({ name: "Exchange Remarks", value: selected.reasonRemarks 
 
       if (totalCustomFees > 0) {
         draftLineItems.push({
-          title: `Custom Size Fee (${totalCustomFees / 200} item${totalCustomFees > 200 ? 's' : ''})`,
+          title: `Custom Size Fee (${totalCustomFees / 250} item${totalCustomFees > 250 ? 's' : ''})`,
           price: totalCustomFees.toFixed(2),
           quantity: 1,
           taxable: false,
@@ -1409,7 +1409,7 @@ else if (isBluedart && trackingNumber) {
           });
 
           adminTotalPriceDifference += (newPrice - originalPrice);
-          if (isCustom) adminTotalCustomFees += 200;
+          if (isCustom) adminTotalCustomFees += 250;
         }
 
         if (!adminIsFirstExchange) adminTotalExchangeFees += 200;
@@ -1435,7 +1435,7 @@ else if (isBluedart && trackingNumber) {
         if (!feeWaived) {
           if (adminTotalCustomFees > 0) {
             adminDraftLineItems.push({
-              title: `Custom Size Fee (${Math.round(adminTotalCustomFees / 200)} item${adminTotalCustomFees > 200 ? 's' : ''})`,
+              title: `Custom Size Fee (${Math.round(adminTotalCustomFees / 250)} item${adminTotalCustomFees > 250 ? 's' : ''})`,
               price: adminTotalCustomFees.toFixed(2),
               quantity: 1,
               taxable: false,
